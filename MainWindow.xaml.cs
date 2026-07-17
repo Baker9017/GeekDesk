@@ -144,7 +144,7 @@ namespace GeekDesk
         {
             // 1) 强制 WPF 重新进入渲染流程
             this.Visibility = Visibility.Collapsed;
-            this.Visibility = Visibility.Visible;
+            this.Visibility = Visibility.Hidden;
 
             // 2) 强制重新布局
             this.UpdateLayout();
@@ -165,6 +165,8 @@ namespace GeekDesk
             // 5) 重新进入前台焦点
             this.Activate();
             this.Activate();
+
+            
         }
 
        
