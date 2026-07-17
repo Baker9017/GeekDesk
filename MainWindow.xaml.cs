@@ -91,13 +91,9 @@ namespace GeekDesk
                 if (source != null)
                 {
                     source.AddHook(WndProcRdp);
-                    LogUtil.WriteLog("[FIX][WTS] Hook installed hwnd=" + hwnd);
                 }
             }
-            catch (Exception ex)
-            {
-                LogUtil.WriteLog("[FIX][WTS] Hook install failed: " + ex.Message);
-            }
+            catch { }
         }
 
         /// <summary>
@@ -109,7 +105,6 @@ namespace GeekDesk
             if (msg == WindowUtil.WM_WTSSESSION_CHANGE)
             {
                 int evt = wParam.ToInt32();
-                LogUtil.WriteLog($"[FIX][WTS] WM_WTSSESSION_CHANGE evt={evt} (1=ConsoleConn 2=ConsoleDisc 3=RemoteConn 4=RemoteDisc 7=Lock 8=Unlock)");
 
                 // 关注以下事件：远程连接/断开、控制台连接/断开、解锁
                 if (evt == WindowUtil.WTS_SESSION_UNLOCK
@@ -118,18 +113,13 @@ namespace GeekDesk
                     || evt == WindowUtil.WTS_REMOTE_DISCONNECT
                     || evt == WindowUtil.WTS_CONSOLE_DISCONNECT)
                 {
-                    // 延迟 300ms 让 session 完全稳定
                     this.Dispatcher.BeginInvoke(new Action(() =>
                     {
                         try
                         {
-                            LogUtil.WriteLog("[FIX][WTS] Rebuilding window after session change...");
                             RebuildWindowAfterRdp();
                         }
-                        catch (Exception ex)
-                        {
-                            LogUtil.WriteLog($"[FIX][WTS] Rebuild error: {ex.Message}");
-                        }
+                        catch { }
                     }), System.Windows.Threading.DispatcherPriority.Background);
                 }
             }
@@ -175,9 +165,6 @@ namespace GeekDesk
             // 5) 重新进入前台焦点
             this.Activate();
             this.Activate();
-
-            LogUtil.WriteLog("[FIX][WTS] Rebuild done. Visibility=" + this.Visibility
-                + " ActualW=" + this.ActualWidth + " ActualH=" + this.ActualHeight);
         }
 
        
@@ -921,10 +908,6 @@ namespace GeekDesk
 
         private void AppWindowLostFocus()
         {
-            LogUtil.WriteLog($"[DIAG][Deactivated] ENTRY Opacity={this.Opacity} LockPanel={RunTimeStatus.LOCK_APP_PANEL} " +
-                $"IgnoreDeact={RunTimeStatus.SHOW_APP_IGNORE_DEACTIVATE} HideType={appData.AppConfig.AppHideType} " +
-                $"MarginHide={appData.AppConfig.MarginHide} IS_HIDE={MarginHide.IS_HIDE}");
-
             if (appData.AppConfig.AppHideType == AppHideType.LOST_FOCUS
                 && this.Opacity == 1 && !RunTimeStatus.LOCK_APP_PANEL)
             {
@@ -934,12 +917,7 @@ namespace GeekDesk
                     // ShowApp 主动显示后 500ms 内忽略 Deactivated 隐藏，避免"一闪而过"
                     if (!RunTimeStatus.SHOW_APP_IGNORE_DEACTIVATE)
                     {
-                        LogUtil.WriteLog("[DIAG][Deactivated] → HideApp");
                         HideApp();
-                    }
-                    else
-                    {
-                        LogUtil.WriteLog("[DIAG][Deactivated] → IGNORED (SHOW_APP_IGNORE_DEACTIVATE)");
                     }
                 }
             }
