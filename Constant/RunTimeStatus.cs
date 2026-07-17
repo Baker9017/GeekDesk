@@ -86,5 +86,13 @@ namespace GeekDesk.Constant
         /// </summary>
         public static volatile int MAIN_HOT_KEY_TIME = 300;
 
+        /// <summary>
+        /// ShowApp 主动显示后，500ms 内禁用 Deactivated → HideApp 隐藏逻辑。
+        /// 原因：RDP 切换后 GetForegroundWindow() 返回 Progman，ShowApp 后立即触发
+        /// Deactivated → HideApp，导致窗口"一闪而过"。500ms 足够让 ShowApp 完成，
+        /// 此后恢复正常行为：点击其他位置 → Deactivated → HideApp。
+        /// </summary>
+        public static volatile bool SHOW_APP_IGNORE_DEACTIVATE = false;
+
     }
 }

@@ -261,18 +261,41 @@ namespace GeekDesk.Util
 
 
         /// <summary>
-        /// 
+        /// 判断目标窗口是否处于"前台可见"状态。
+        ///
+        /// 问题背景：WS_EX_LAYERED (AllowsTransparency=True) 窗口在 RDP session 切换后，
+        /// GetForegroundWindow() 可能返回 Progman 或没有窗口标题的系统窗口。
+        ///
+        /// 判定逻辑：
+        ///   1. Foreground 是我自己 → 可见
+        ///   2. Foreground 是 Progman (桌面 Shell) → 可见（用户正在看桌面）
+        ///   3. Foreground 是 SHELLDLL_DEFVIEW (文件夹视图) → 可见
+        ///   4. 窗口本身被 Foreground (Activate 成功) → 可见
+        ///   5. 其他所有情况 → 不可见（被其他窗口遮挡）
         /// </summary>
-        /// <param name="window"></param>
-        /// <returns></returns>
         public static bool WindowIsTop(Window window)
         {
             IntPtr handle = new WindowInteropHelper(window).Handle;
-            IntPtr deskHandle = GetDesktopHandle(window, DesktopLayer.Progman);
             IntPtr topHandle = GetForegroundWindow();
-            //暂时不能正确获取桌面handle  但发现焦点在桌面时 window title为空
-            string windowTitle = GetWindowTitle(topHandle);
-            return topHandle.Equals(handle) || topHandle.Equals(deskHandle) || string.IsNullOrEmpty(windowTitle);
+
+            // 1. 前台窗口是自己
+            if (topHandle == handle) return true;
+
+            // 2. 前台是 Progman (桌面窗口)
+            IntPtr progmanHandle = FindWindow("Progman", null);
+            if (topHandle == progmanHandle) return true;
+
+            // 3. 前台是 Shell 文件夹视图 (桌面上的图标区域)
+            IntPtr shdllHandle = FindWindowEx(progmanHandle, IntPtr.Zero, "SHELLDLL_DefView", null);
+            if (shdllHandle != IntPtr.Zero && topHandle == shdllHandle) return true;
+
+            // 4. 前台是 WorkerW (另一个 Worker 窗口，也属于桌面 shell)
+            IntPtr workerWHandle = FindWindowEx(IntPtr.Zero, progmanHandle, "WorkerW", null);
+            if (workerWHandle != IntPtr.Zero && topHandle == workerWHandle) return true;
+
+            // 5. 如果上述都不是，说明有其他应用程序窗口在前面，返回 false
+            // 不再使用 string.IsNullOrEmpty(windowTitle) 这种不可靠的判断
+            return false;
         }
 
         private static string GetWindowTitle(IntPtr handle)
@@ -285,6 +308,53 @@ namespace GeekDesk.Util
             }
             return null;
         }
+
+        #region RDP 后强制重绘 layered window
+
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter,
+            int X, int Y, int cx, int cy, uint uFlags);
+
+        [DllImport("user32.dll")]
+        private static extern bool RedrawWindow(IntPtr hWnd, IntPtr lprcUpdate,
+            IntPtr hrgnUpdate, uint flags);
+
+        private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+        private static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
+        private const uint SWP_NOMOVE = 0x0002;
+        private const uint SWP_NOSIZE = 0x0001;
+        private const uint SWP_NOACTIVATE = 0x0010;
+        private const uint SWP_SHOWWINDOW = 0x0040;
+
+        private const uint RDW_INVALIDATE = 0x0001;
+        private const uint RDW_UPDATENOW = 0x0100;
+        private const uint RDW_ALLCHILDREN = 0x0080;
+        private const uint RDW_ERASE = 0x0004;
+        private const uint RDW_FRAME = 0x0400;
+
+        /// <summary>
+        /// 强制把窗口置顶 + 触发系统重排 Z-order。
+        /// RDP 切换后 WS_EX_LAYERED 窗口的 z-order 缓存可能错误，必须显式 SetWindowPos。
+        /// </summary>
+        public static void SetWindowPosForceTop(IntPtr hwnd)
+        {
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+
+        /// <summary>
+        /// 强制重绘窗口及其所有子窗口。
+        /// RDP 切换后系统可能不会自动重画 WS_EX_LAYERED 窗口，必须显式 RedrawWindow。
+        /// </summary>
+        public static void RedrawWindowForce(IntPtr hwnd)
+        {
+            RedrawWindow(hwnd, IntPtr.Zero, IntPtr.Zero,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_ERASE | RDW_FRAME);
+        }
+
+        #endregion
 
 
 
@@ -317,6 +387,22 @@ namespace GeekDesk.Util
             }
             return hDesktop;
         }
+
+        #region RDP Session 切换监听
+
+        /// <summary>
+        /// WM_WTSSESSION_CHANGE 消息 —— Windows 在 RDP session 状态变化时广播。
+        /// 解锁事件 (WTS_SESSION_UNLOCK) 是 RDP 重连后最可靠的触发点。
+        /// </summary>
+        public const int WM_WTSSESSION_CHANGE = 0x02B1;
+        public const int WTS_SESSION_LOCK = 0x0007;
+        public const int WTS_SESSION_UNLOCK = 0x0008;
+        public const int WTS_CONSOLE_CONNECT = 0x0001;
+        public const int WTS_CONSOLE_DISCONNECT = 0x0002;
+        public const int WTS_REMOTE_CONNECT = 0x0003;
+        public const int WTS_REMOTE_DISCONNECT = 0x0004;
+
+        #endregion
 
     }
 

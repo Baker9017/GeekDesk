@@ -84,8 +84,100 @@ namespace GeekDesk
             {
                 //禁用窗口最大化
                 WindowUtil.DisableMaxWindow(this);
+
+                // 安装 RDP session 切换监听 hook
+                IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+                var source = System.Windows.Interop.HwndSource.FromHwnd(hwnd);
+                if (source != null)
+                {
+                    source.AddHook(WndProcRdp);
+                    LogUtil.WriteLog("[FIX][WTS] Hook installed hwnd=" + hwnd);
+                }
             }
-            catch (Exception) { }
+            catch (Exception ex)
+            {
+                LogUtil.WriteLog("[FIX][WTS] Hook install failed: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// WndProcRdp 钩子 —— 监听 WM_WTSSESSION_CHANGE，处理 RDP session 切换。
+        /// RDP 重连后 WPF 渲染线程的 MIL 可能挂起，需要主动 Show() + 强制重绘。
+        /// </summary>
+        private IntPtr WndProcRdp(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (msg == WindowUtil.WM_WTSSESSION_CHANGE)
+            {
+                int evt = wParam.ToInt32();
+                LogUtil.WriteLog($"[FIX][WTS] WM_WTSSESSION_CHANGE evt={evt} (1=ConsoleConn 2=ConsoleDisc 3=RemoteConn 4=RemoteDisc 7=Lock 8=Unlock)");
+
+                // 关注以下事件：远程连接/断开、控制台连接/断开、解锁
+                if (evt == WindowUtil.WTS_SESSION_UNLOCK
+                    || evt == WindowUtil.WTS_REMOTE_CONNECT
+                    || evt == WindowUtil.WTS_CONSOLE_CONNECT
+                    || evt == WindowUtil.WTS_REMOTE_DISCONNECT
+                    || evt == WindowUtil.WTS_CONSOLE_DISCONNECT)
+                {
+                    // 延迟 300ms 让 session 完全稳定
+                    this.Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        try
+                        {
+                            LogUtil.WriteLog("[FIX][WTS] Rebuilding window after session change...");
+                            RebuildWindowAfterRdp();
+                        }
+                        catch (Exception ex)
+                        {
+                            LogUtil.WriteLog($"[FIX][WTS] Rebuild error: {ex.Message}");
+                        }
+                    }), System.Windows.Threading.DispatcherPriority.Background);
+                }
+            }
+            return IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// RDP 切换后重建 WPF 窗口状态。
+        ///
+        /// 根因：WS_EX_LAYERED (AllowsTransparency=True) 窗口在 RDP session 切换后，
+        /// WPF 的 MIL (Media Integration Layer) 渲染线程可能挂起，窗口虽然 Visible 但不绘制内容。
+        ///
+        /// 修复策略（多重保险）：
+        ///   1) Visibility=Visible（强制 WPF 重新走渲染管线）
+        ///   2) Activate()（重新进入前台焦点）
+        ///   3) SetWindowPos(HWND_TOP) 触发 DWM 重排 z-order
+        ///   4) RedrawWindow(RDW_UPDATENOW|RDW_ALLCHILDREN) 强制整棵可视树重画
+        ///   5) UpdateLayout() 让 WPF 重新布局
+        ///   6) InvalidateVisual() 标记需要重绘
+        /// </summary>
+        private void RebuildWindowAfterRdp()
+        {
+            // 1) 强制 WPF 重新进入渲染流程
+            this.Visibility = Visibility.Collapsed;
+            this.Visibility = Visibility.Visible;
+
+            // 2) 强制重新布局
+            this.UpdateLayout();
+
+            // 3) 标记整棵树需要重绘
+            this.InvalidateVisual();
+            this.InvalidateArrange();
+            this.InvalidateMeasure();
+
+            // 4) Win32 层强制 z-order 重排
+            IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+            if (hwnd != IntPtr.Zero)
+            {
+                WindowUtil.SetWindowPosForceTop(hwnd);
+                WindowUtil.RedrawWindowForce(hwnd);
+            }
+
+            // 5) 重新进入前台焦点
+            this.Activate();
+            this.Activate();
+
+            LogUtil.WriteLog("[FIX][WTS] Rebuild done. Visibility=" + this.Visibility
+                + " ActualW=" + this.ActualWidth + " ActualH=" + this.ActualHeight);
         }
 
        
@@ -626,6 +718,17 @@ namespace GeekDesk
                 }
             }
 
+            // RDP 切换后，ShowApp 后 Deactivated 会立即触发导致窗口一闪而过。
+            // 通过此标志位让 Deactivated 在 500ms 内忽略 HideApp，给窗口稳定显示的时间。
+            RunTimeStatus.SHOW_APP_IGNORE_DEACTIVATE = true;
+            System.Threading.Thread th = new System.Threading.Thread(() =>
+            {
+                System.Threading.Thread.Sleep(500);
+                RunTimeStatus.SHOW_APP_IGNORE_DEACTIVATE = false;
+            });
+            th.IsBackground = true;
+            th.Start();
+
 
             //FadeStoryBoard(1, (int)CommonEnum.WINDOW_ANIMATION_TIME, Visibility.Visible);
 
@@ -727,7 +830,12 @@ namespace GeekDesk
         /// <param name="e"></param>
         private void NotifyIcon_Click(object sender, RoutedEventArgs e)
         {
-            if (CheckShouldShowApp())
+            // 直接使用 Visibility 判断，不依赖 WindowIsTop()。
+            // 原因：WindowIsTop() 在 RDP 切换后可能误判（GetForegroundWindow 返回 Progman），
+            // 导致 CheckShouldShowApp() 错误返回 false，第二次点击时调用 HideApp() 而不是 ShowApp()。
+            if (mainWindow.Visibility == Visibility.Collapsed
+                || mainWindow.Opacity == 0
+                || MarginHide.IS_HIDE)
             {
                 ShowApp();
             }
@@ -813,13 +921,26 @@ namespace GeekDesk
 
         private void AppWindowLostFocus()
         {
+            LogUtil.WriteLog($"[DIAG][Deactivated] ENTRY Opacity={this.Opacity} LockPanel={RunTimeStatus.LOCK_APP_PANEL} " +
+                $"IgnoreDeact={RunTimeStatus.SHOW_APP_IGNORE_DEACTIVATE} HideType={appData.AppConfig.AppHideType} " +
+                $"MarginHide={appData.AppConfig.MarginHide} IS_HIDE={MarginHide.IS_HIDE}");
+
             if (appData.AppConfig.AppHideType == AppHideType.LOST_FOCUS
                 && this.Opacity == 1 && !RunTimeStatus.LOCK_APP_PANEL)
             {
                 //如果开启了贴边隐藏 则窗体不贴边才隐藏窗口
                 if (!appData.AppConfig.MarginHide || (appData.AppConfig.MarginHide && !MarginHide.IS_HIDE))
                 {
-                    HideApp();
+                    // ShowApp 主动显示后 500ms 内忽略 Deactivated 隐藏，避免"一闪而过"
+                    if (!RunTimeStatus.SHOW_APP_IGNORE_DEACTIVATE)
+                    {
+                        LogUtil.WriteLog("[DIAG][Deactivated] → HideApp");
+                        HideApp();
+                    }
+                    else
+                    {
+                        LogUtil.WriteLog("[DIAG][Deactivated] → IGNORED (SHOW_APP_IGNORE_DEACTIVATE)");
+                    }
                 }
             }
         }
