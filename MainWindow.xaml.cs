@@ -445,8 +445,8 @@ namespace GeekDesk
             FileWatcher.EnableLinkMenuWatcher(appData);
 
 
-            //更新任务开启  检测更新
-            UpdateTask.Start();
+            //更新任务已禁用
+            //UpdateTask.Start();
 
             //建立相对路径
             RelativePathThread.MakeRelativePath();
