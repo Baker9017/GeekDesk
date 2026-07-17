@@ -822,7 +822,7 @@ namespace GeekDesk
             // 直接使用 Visibility 判断，不依赖 WindowIsTop()。
             // 原因：WindowIsTop() 在 RDP 切换后可能误判（GetForegroundWindow 返回 Progman），
             // 导致 CheckShouldShowApp() 错误返回 false，第二次点击时调用 HideApp() 而不是 ShowApp()。
-            if (mainWindow.Visibility == Visibility.Collapsed
+            if (mainWindow.Visibility == Visibility.Collapsed || mainWindow.Visibility ==  Visibility.Hidden
                 || mainWindow.Opacity == 0
                 || MarginHide.IS_HIDE)
             {
@@ -836,10 +836,11 @@ namespace GeekDesk
 
         private static bool CheckShouldShowApp()
         {
-            return mainWindow.Visibility == Visibility.Collapsed
-                || mainWindow.Opacity == 0
-                || MarginHide.IS_HIDE
-                || !WindowUtil.WindowIsTop(mainWindow);
+            return mainWindow.Visibility == Visibility.Collapsed 
+                || mainWindow.Visibility == Visibility.Hidden
+                                 || mainWindow.Opacity == 0
+                                 || MarginHide.IS_HIDE
+                                 || !WindowUtil.WindowIsTop(mainWindow);
         }
 
         /// <summary>
