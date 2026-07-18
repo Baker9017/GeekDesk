@@ -298,6 +298,47 @@ namespace GeekDesk.Util
             return false;
         }
 
+        /// <summary>
+        /// 远程控制软件进程名集合（MSTSC / TightVNC / RealVNC 等）。
+        /// 当前台窗口属于这些进程时，GeekDesk 不应弹出，以免与远端转发输入冲突。
+        /// </summary>
+        private static readonly HashSet<string> RemoteControlProcesses = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "mstsc",
+            "tvnviewer",
+            "vncviewer",
+            "vncviewer64",
+            "realvnc",
+            "winvnc"
+        };
+
+        /// <summary>
+        /// 判断当前前台窗口是否属于远程控制软件（MSTSC / VNC 等）。
+        /// 任意异常均返回 false，确保检测失败时不会阻塞弹窗。
+        /// </summary>
+        public static bool IsForegroundRemoteApp()
+        {
+            try
+            {
+                IntPtr hwnd = GetForegroundWindow();
+                if (hwnd == IntPtr.Zero) return false;
+
+                GetWindowThreadProcessId(hwnd, out int pid);
+                if (pid <= 0) return false;
+
+                using (Process proc = Process.GetProcessById(pid))
+                {
+                    string name = proc.ProcessName;
+                    if (string.IsNullOrEmpty(name)) return false;
+                    return RemoteControlProcesses.Contains(name);
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private static string GetWindowTitle(IntPtr handle)
         {
             const int nChars = 256;

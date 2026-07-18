@@ -57,6 +57,11 @@ namespace GeekDesk.MyThread
             //中键打开App
             if (appConfig.MouseMiddleShow && MotionControl.hotkeyFinished)
             {
+                // MSTSC / VNC 会把中键转发到远端，若前台是这些进程则不弹出，避免冲突
+                if (WindowUtil.IsForegroundRemoteApp())
+                {
+                    return;
+                }
                 App.Current.Dispatcher.Invoke(DispatcherPriority.Normal, new Action(() =>
                 {
                     if (MainWindow.mainWindow.Visibility == Visibility.Collapsed || MainWindow.mainWindow.Opacity == 0)

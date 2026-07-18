@@ -503,6 +503,11 @@ namespace GeekDesk
 
                         if (MotionControl.hotkeyFinished)
                         {
+                            // 若前台是 MSTSC / VNC 等远程控制软件，则忽略此次热键，避免与远端转发输入冲突
+                            if (WindowUtil.IsForegroundRemoteApp())
+                            {
+                                return;
+                            }
                             if (CheckShouldShowApp())
                             {
                                 ShowApp();
