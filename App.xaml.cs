@@ -33,6 +33,7 @@ namespace GeekDesk
         private void App_Startup(object sender, StartupEventArgs e)
         {
             //RenderOptions.ProcessRenderMode = System.Windows.Interop.RenderMode.SoftwareOnly; //禁用硬件加速
+            LogUtil.ClearQuickSwitchLog();
             mutex = new System.Threading.Mutex(true, Constants.MY_NAME, out bool ret);
             if (!ret)
             {

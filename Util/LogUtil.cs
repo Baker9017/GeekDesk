@@ -78,6 +78,21 @@ namespace GeekDesk.Util
             catch { }
         }
 
+        public static void ClearQuickSwitchLog()
+        {
+            try
+            {
+                string dir = Constants.QUICK_SWITCH_LOG_PATH.Substring(0, Constants.QUICK_SWITCH_LOG_PATH.LastIndexOf("\\"));
+                if (!Directory.Exists(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+                // 启动时清空日志
+                using (FileStream fs = File.Open(Constants.QUICK_SWITCH_LOG_PATH, FileMode.Create, FileAccess.Write)) { }
+            }
+            catch { }
+        }
+
         public static void WriteQuickSwitchLog(string msg)
         {
             try
@@ -87,9 +102,8 @@ namespace GeekDesk.Util
                 {
                     Directory.CreateDirectory(dir);
                 }
-                using (FileStream fs = File.Open(Constants.QUICK_SWITCH_LOG_PATH, FileMode.OpenOrCreate, FileAccess.Write))
+                using (FileStream fs = File.Open(Constants.QUICK_SWITCH_LOG_PATH, FileMode.Append, FileAccess.Write))
                 {
-                    fs.Seek(0, SeekOrigin.End);
                     byte[] buffer = Encoding.Default.GetBytes(DateTime.Now.ToString("HH:mm:ss.fff") + " " + msg + "\r\n");
                     fs.Write(buffer, 0, buffer.Length);
                 }

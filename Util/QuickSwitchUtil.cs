@@ -36,6 +36,13 @@ namespace GeekDesk.Util
         private static extern int AccessibleObjectFromWindow(IntPtr hwnd, uint dwId, ref Guid riid, out IntPtr ppvObject);
 
         private static readonly Guid IID_IAccessible = new Guid("618736E0-3C3D-11CF-810C-02803C1174A1");
+        // IWebBrowserApp - 直接请求这个接口, 拿到后用 IDispatch 调度 LocationURL.
+        private static readonly Guid IID_IWebBrowserApp = new Guid("0002DF05-0000-0000-C000-000000000046");
+        // IServiceProvider - 用于在 IE/Explorer 浏览器对象上查询子接口.
+        private static readonly Guid IID_IServiceProvider = new Guid("6D5140C1-7436-11CE-8034-00AA006009FA");
+        // IShellBrowser - 用来枚举当前 tab.
+        private static readonly Guid IID_IShellBrowser = new Guid("C08AFD90-F2A1-11D1-8455-00A0C91F3880");
+        // IID_IHlinkFrame (备选) etc.
         // OBJID_WINDOW 用类里已经声明的 public const
 
         private static readonly Guid CLSID_ShellWindows = new Guid("9BA05972-F6A8-11CF-A442-00A0C90A8F39");
@@ -246,91 +253,75 @@ namespace GeekDesk.Util
 
         #endregion
 
-        #region MSAA (IAccessible) 备用读取 Explorer 地址栏
+        #region MSAA / WM_GETOBJECT 读取 Explorer 地址栏
+
+        // WM_GETOBJECT + LresultFromObject 是 OleAcc 提供的一种获取 accessibility 对象的机制,
+        // 可以在 AccessibleObjectFromWindow 失败时作为备选.
+        private const int WM_GETOBJECT = 0x003D;
+        private const int WM_COPYDATA = 0x004A;
+
+        // IDispatch 的 DISPID for common members:
+        //   DISPID_NEWENUM = -4 (newenum)
+        //   DISPID_VALUE   = 0  (default property)
+        //   DISPID_COUNT   = 1  (count)
+        private const int DISPID_NEWENUM = -4;
+        private const int DISPID_VALUE = 0;
 
         /// <summary>
-        /// 通过 MSAA / IAccessible 读取 Explorer 窗口地址栏。
-        /// 对 Win10/Win11 都稳定 (UI Automation 在某些场景会失败, MSAA 仍可用)。
+        /// 方式1: AccessibleObjectFromWindow → IWebBrowserApp → LocationURL.
+        /// 方式2: WM_GETOBJECT → IDispatch → 遍历子窗口找 LocationURL.
         /// 必须 STA 线程。
         /// </summary>
         public static string GetExplorerPathViaAccessible(IntPtr hwnd)
         {
             if (hwnd == IntPtr.Zero || !IsWindow(hwnd)) return null;
 
-            IntPtr pAcc = IntPtr.Zero;
+            uint pid = 0;
+            GetWindowThreadProcessId(hwnd, out pid);
+            string cls = GetClassNameString(hwnd);
+
+            // 方式1: AccessibleObjectFromWindow (和之前一样, 保留以防某些系统可用)
+            IntPtr pDisp = IntPtr.Zero;
             try
             {
-                Guid iid = IID_IAccessible;
-                int hr = AccessibleObjectFromWindow(hwnd, OBJID_WINDOW, ref iid, out pAcc);
-                if (hr != 0 || pAcc == IntPtr.Zero) return null;
-
-                // 用反射调 IAccessible.get_accValue / get_accName (避免引用 Interop.UIAutomationClient 等)
-                var acc = Marshal.GetObjectForIUnknown(pAcc);
-                if (acc == null) return null;
-
-                Type t = acc.GetType();
-                string found = null;
-                found = WalkAccessible(acc, t, depth: 0);
-                return found;
-            }
-            catch (Exception ex)
-            {
-                LogUtil.WriteQuickSwitchLog("GetExplorerPathViaAccessible EX: " + ex.Message);
-                return null;
-            }
-            finally
-            {
-                if (pAcc != IntPtr.Zero) Marshal.Release(pAcc);
-            }
-        }
-
-        private static string WalkAccessible(object acc, Type t, int depth)
-        {
-            if (acc == null || depth > 6) return null;
-
-            // 读当前 accValue / accName
-            try
-            {
-                object v = t.InvokeMember("accValue", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { 0 });
-                if (v is string s && !string.IsNullOrEmpty(s))
+                Guid iidWb = IID_IWebBrowserApp;
+                int hr = AccessibleObjectFromWindow(hwnd, OBJID_WINDOW, ref iidWb, out pDisp);
+                if (hr == 0 && pDisp != IntPtr.Zero)
                 {
-                    string dec = UnescapeMsaa(s);
-                    if (IsValidPath(dec)) return dec;
+                    string path = TryReadLocationUrl(pDisp);
+                    Marshal.Release(pDisp);
+                    pDisp = IntPtr.Zero;
+                    if (!string.IsNullOrEmpty(path)) return path;
                 }
             }
             catch { }
-            try
+            finally { if (pDisp != IntPtr.Zero) { Marshal.Release(pDisp); pDisp = IntPtr.Zero; } }
+
+            // 方式2: WM_GETOBJECT → 直接取窗口的 IDispatch (LresultFromObject).
+            //    发 WM_GETOBJECT 到目标窗口, OLEACC 返回一个 LRESULT, 用 ObjectFromLresult 解出 IDispatch.
+            pDisp = TryGetDispatchViaWmGetObject(hwnd);
+            if (pDisp != IntPtr.Zero)
             {
-                object n = t.InvokeMember("accName", System.Reflection.BindingFlags.GetProperty, null, acc, new object[] { 0 });
-                if (n is string s2 && !string.IsNullOrEmpty(s2))
+                try
                 {
-                    string dec = UnescapeMsaa(s2);
-                    if (IsValidPath(dec)) return dec;
+                    string path = TryReadLocationUrl(pDisp);
+                    if (!string.IsNullOrEmpty(path)) return path;
+
+                    // 如果当前 IDispatch 本身不是浏览器对象, 遍历 Item() / Children.
+                    path = TryEnumDispatchChildren(pDisp, depth: 0);
+                    if (!string.IsNullOrEmpty(path)) return path;
                 }
+                finally { Marshal.Release(pDisp); pDisp = IntPtr.Zero; }
             }
-            catch { }
 
-            // 遍历子对象 (accChildCount + get_accChild)
+            // 方式3: UI Automation (最底层保障).
             try
             {
-                object cc = t.InvokeMember("accChildCount", System.Reflection.BindingFlags.GetProperty, null, acc, null);
-                if (cc is int cnt && cnt > 0)
+                var ae = AutomationElement.FromHandle(hwnd);
+                if (ae != null)
                 {
-                    for (int i = 1; i <= Math.Min(cnt, 200); i++)
-                    {
-                        object child = null;
-                        try
-                        {
-                            child = t.InvokeMember("get_accChild", System.Reflection.BindingFlags.InvokeMethod, null, acc, new object[] { i });
-                        }
-                        catch { }
-                        if (child == null) continue;
-
-                        // child 本身就是 IAccessible 代理, 直接 WalkAccessible
-                        if (child == null) continue;
-                        string r = WalkAccessible(child, child.GetType(), depth + 1);
-                        if (!string.IsNullOrEmpty(r)) return r;
-                    }
+                    string path = TryReadPathFromUIAutomation(ae);
+                    if (!string.IsNullOrEmpty(path)) return path;
                 }
             }
             catch { }
@@ -338,12 +329,290 @@ namespace GeekDesk.Util
             return null;
         }
 
-        private static string UnescapeMsaa(string s)
+        /// <summary>
+        /// 通过 SendMessage(WM_GETOBJECT, 0, lParam) + ObjectFromLresult 获取窗口的 IDispatch.
+        /// 这是 AccessibleObjectFromWindow 的底层实现, 在某些情况下更可靠.
+        /// </summary>
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        private static extern IntPtr SendMessageTimeout(
+            IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam,
+            uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
+
+        private const uint SMTO_ABORTIFHUNG = 0x0002;
+
+        [DllImport("oleacc.dll")]
+        private static extern int ObjectFromLresult(IntPtr lResult, ref Guid riid, IntPtr wParam, out IntPtr ppvObject);
+
+        private static IntPtr TryGetDispatchViaWmGetObject(IntPtr hwnd)
         {
-            if (string.IsNullOrEmpty(s)) return s;
-            try { s = Uri.UnescapeDataString(s); } catch { }
-            return s.Replace('/', '\\');
+            IntPtr lpdwResult;
+            IntPtr lResult = SendMessageTimeout(hwnd, WM_GETOBJECT, IntPtr.Zero, (IntPtr)OBJID_WINDOW,
+                SMTO_ABORTIFHUNG, 500, out lpdwResult);
+            if (lResult == IntPtr.Zero || lResult == new IntPtr(-1)) return IntPtr.Zero;
+
+            Guid iid = IID_IDispatch;
+            IntPtr pDisp;
+            int hr = ObjectFromLresult(lResult, ref iid, IntPtr.Zero, out pDisp);
+            if (hr == 0 && pDisp != IntPtr.Zero) return pDisp;
+
+            // 备选: 请求 IAccessible
+            iid = IID_IAccessible;
+            hr = ObjectFromLresult(lResult, ref iid, IntPtr.Zero, out pDisp);
+            if (hr == 0 && pDisp != IntPtr.Zero)
+            {
+                // 把 IAccessible 转成 IDispatch
+                IntPtr pUnk = IntPtr.Zero;
+                try
+                {
+                    Guid iidUnk = IID_IUnknown;
+                    hr = Marshal.QueryInterface(pDisp, ref iidUnk, out pUnk);
+                    if (hr == 0 && pUnk != IntPtr.Zero)
+                    {
+                        var obj = Marshal.GetObjectForIUnknown(pUnk);
+                        if (obj != null)
+                        {
+                            pUnk = IntPtr.Zero; // obj 现在持有引用
+                            Marshal.ReleaseComObject(obj);
+                            return pDisp; // 返回 IAccessible 指针, TryReadLocationUrl 会处理
+                        }
+                    }
+                }
+                finally
+                {
+                    if (pUnk != IntPtr.Zero) Marshal.Release(pUnk);
+                }
+            }
+            return IntPtr.Zero;
         }
+
+        /// <summary>
+        /// 遍历 IDispatch 集合的子成员 (Item() / _NewEnum), 找 LocationURL.
+        /// </summary>
+        private static string TryEnumDispatchChildren(IntPtr pDisp, int depth)
+        {
+            if (pDisp == IntPtr.Zero || depth > 4) return null;
+            try
+            {
+                var obj = Marshal.GetObjectForIUnknown(pDisp);
+                if (obj == null) return null;
+                try
+                {
+                    Type t = obj.GetType();
+
+                    // 先试试 LocationURL
+                    try
+                    {
+                        object val = t.InvokeMember("LocationURL", System.Reflection.BindingFlags.GetProperty, null, obj, null);
+                        if (val is string s && !string.IsNullOrEmpty(s))
+                        {
+                            string path = UrlToPath(s);
+                            if (!string.IsNullOrEmpty(path)) return path;
+                        }
+                    }
+                    catch { }
+
+                    // 遍历 Item(index) 或 _NewEnum
+                    try
+                    {
+                        // 先尝试 _NewEnum (DISPID = -4)
+                        object newEnum = t.InvokeMember("_NewEnum",
+                            System.Reflection.BindingFlags.GetProperty | System.Reflection.BindingFlags.GetField,
+                            null, obj, null);
+                        if (newEnum != null)
+                        {
+                            // IEnumVARIANT 遍历
+                            string path = TryEnumViaIEnumVariant(newEnum, depth + 1);
+                            if (!string.IsNullOrEmpty(path)) return path;
+                        }
+                    }
+                    catch { }
+
+                    // 尝试 Item(index) for index = 0..15
+                    for (int i = 0; i < 16; i++)
+                    {
+                        try
+                        {
+                            object item = t.InvokeMember("Item",
+                                System.Reflection.BindingFlags.InvokeMethod,
+                                null, obj, new object[] { i });
+                            if (item != null)
+                            {
+                                IntPtr pItem = Marshal.GetIUnknownForObject(item);
+                                if (pItem != IntPtr.Zero)
+                                {
+                                    try
+                                    {
+                                        string path = TryReadLocationUrl(pItem);
+                                        if (!string.IsNullOrEmpty(path)) return path;
+                                    }
+                                    finally { Marshal.Release(pItem); }
+                                }
+                                Marshal.ReleaseComObject(item);
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                finally { Marshal.ReleaseComObject(obj); }
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>
+        /// 对 IEnumVARIANT 调用 Next() 遍历子元素, 找 LocationURL.
+        /// </summary>
+        private static string TryEnumViaIEnumVariant(object enumObj, int depth)
+        {
+            if (enumObj == null || depth > 3) return null;
+            try
+            {
+                Type t = enumObj.GetType();
+                // IEnumVARIANT::Next(1, out var, out fetched)
+                object[] args = new object[3];
+                args[0] = 1; // celt
+                int fetched = 0;
+
+                for (int i = 0; i < 20; i++)
+                {
+                    args[1] = null;
+                    args[2] = 0;
+                    try
+                    {
+                        t.InvokeMember("Next",
+                            System.Reflection.BindingFlags.InvokeMethod,
+                            null, enumObj, args);
+                        fetched = (int)args[2];
+                    }
+                    catch
+                    {
+                        // Next 可能用 DISPID 0 (Value) 作为方法名
+                        try
+                        {
+                            object r = t.InvokeMember("Next",
+                                System.Reflection.BindingFlags.InvokeMethod,
+                                null, enumObj,
+                                new object[] { 1 });
+                            if (r != null && r.GetType().IsArray)
+                            {
+                                var arr = (Array)r;
+                                if (arr.Length >= 1) args[1] = arr.GetValue(0);
+                                fetched = arr.Length;
+                            }
+                        }
+                        catch { break; }
+                    }
+
+                    if (fetched <= 0 || args[1] == null) break;
+
+                    // 获取 IDispatch / IWebBrowserApp 指针
+                    IntPtr pItem = IntPtr.Zero;
+                    try
+                    {
+                        if (args[1] is DispatchWrapper dw)
+                        {
+                            pItem = Marshal.GetIUnknownForObject(dw.WrappedObject);
+                        }
+                        else
+                        {
+                            pItem = Marshal.GetIUnknownForObject(args[1]);
+                        }
+
+                        if (pItem != IntPtr.Zero)
+                        {
+                            string path = TryReadLocationUrl(pItem);
+                            if (!string.IsNullOrEmpty(path)) return path;
+                        }
+                    }
+                    catch { }
+                    finally { if (pItem != IntPtr.Zero) Marshal.Release(pItem); }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>
+        /// UI Automation 最底层保障: 找 Edit/ComboBox 控件的 ValuePattern.
+        /// </summary>
+        private static string TryReadPathFromUIAutomation(AutomationElement ae)
+        {
+            try
+            {
+                var edits = ae.FindAll(TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit));
+                foreach (AutomationElement edit in edits)
+                {
+                    try
+                    {
+                        if (edit.Current.Name != null && IsValidPath(edit.Current.Name))
+                            return edit.Current.Name;
+                        var vp = edit.GetCurrentPattern(ValuePattern.Pattern) as ValuePattern;
+                        if (vp != null && !string.IsNullOrEmpty(vp.Current.Value) && IsValidPath(vp.Current.Value))
+                            return vp.Current.Value;
+                    }
+                    catch { }
+                }
+
+                var combos = ae.FindAll(TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ComboBox));
+                foreach (AutomationElement combo in combos)
+                {
+                    try
+                    {
+                        var vp = combo.GetCurrentPattern(ValuePattern.Pattern) as ValuePattern;
+                        if (vp != null && !string.IsNullOrEmpty(vp.Current.Value) && IsValidPath(vp.Current.Value))
+                            return vp.Current.Value;
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>
+        /// 给定一个 IDispatch 指针, 通过 GetIDsOfNames("LocationURL") / Invoke 拿到 URL 字符串。
+        /// </summary>
+        private static string TryReadLocationUrl(IntPtr pDisp)
+        {
+            if (pDisp == IntPtr.Zero) return null;
+            try
+            {
+                // Marshal.GetObjectForIUnknown 拿到 RCW, 然后用反射 InvokeMember "LocationURL".
+                var obj = Marshal.GetObjectForIUnknown(pDisp);
+                if (obj == null) return null;
+                try
+                {
+                    object val = obj.GetType().InvokeMember("LocationURL",
+                        System.Reflection.BindingFlags.GetProperty,
+                        null, obj, null);
+                    if (val is string s && !string.IsNullOrEmpty(s))
+                    {
+                        string path = UrlToPath(s);
+                        if (!string.IsNullOrEmpty(path) && IsValidPath(path)) return path;
+                    }
+                    else
+                    {
+                        LogUtil.WriteQuickSwitchLog("TryReadLocationUrl: LocationURL val=" + (val ?? (object)"null") + " url=" + (val as string ?? ""));
+                    }
+                }
+                catch (Exception ex2)
+                {
+                    LogUtil.WriteQuickSwitchLog("TryReadLocationUrl: InvokeMember LocationURL EX: " + ex2.Message);
+                }
+                finally
+                {
+                    Marshal.ReleaseComObject(obj);
+                }
+            }
+            catch (Exception ex)
+            {
+                LogUtil.WriteQuickSwitchLog("TryReadLocationUrl EX: " + ex.Message);
+            }
+            return null;
+        }
+
 
         #endregion
 
