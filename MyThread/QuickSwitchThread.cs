@@ -65,10 +65,12 @@ namespace GeekDesk.MyThread
                     0, 0,
                     QuickSwitchUtil.WINEVENT_OUTOFCONTEXT | QuickSwitchUtil.WINEVENT_SKIPOWNPROCESS);
 
-                // Hook 资源管理器位置变化 / 切换前台
+                // Hook 资源管理器切换前台 / 窗口内导航 (标题栏改变)
+                // EVENT_OBJECT_NAMECHANGE (0x800C) 在 Explorer 切换到子文件夹时触发 (标题栏更新),
+                // 比 EVENT_OBJECT_LOCATIONCHANGE (0x800B) 多一个值, 但这是捕获窗口内导航的关键事件.
                 _hookExplorer = QuickSwitchUtil.SetWinEventHook(
                     QuickSwitchUtil.EVENT_SYSTEM_FOREGROUND,
-                    QuickSwitchUtil.EVENT_OBJECT_LOCATIONCHANGE,
+                    QuickSwitchUtil.EVENT_OBJECT_NAMECHANGE,
                     IntPtr.Zero,
                     _explorerProc,
                     0, 0,

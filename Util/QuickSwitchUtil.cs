@@ -562,6 +562,7 @@ namespace GeekDesk.Util
         public const uint EVENT_OBJECT_HIDE = 0x8003;
         public const uint EVENT_OBJECT_FOCUS = 0x8005;
         public const uint EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
+        public const uint EVENT_OBJECT_NAMECHANGE = 0x800C;  // 窗口标题改变 (Explorer 导航时触发)
         public const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
 
         public const uint WINEVENT_OUTOFCONTEXT = 0x0000;
