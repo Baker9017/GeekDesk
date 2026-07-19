@@ -226,6 +226,9 @@ namespace GeekDesk.MyThread
                     {
                         try
                         {
+                            // 二次确认: BeginInvoke 有延迟, 对话框可能已在此期间全部关闭
+                            if (QuickSwitchUtil.TrackedDialogs.IsEmpty) return;
+
                             string path = QuickSwitchUtil.GetPathFromExplorerWindow(hwnd);
                             if (string.IsNullOrEmpty(path) || !QuickSwitchUtil.IsValidPath(path)) return;
 
