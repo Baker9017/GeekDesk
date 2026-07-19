@@ -78,6 +78,7 @@ namespace GeekDesk.Util
             catch { }
         }
 
+        [System.Diagnostics.Conditional("DEBUG")]
         public static void ClearQuickSwitchLog()
         {
             try
@@ -93,6 +94,7 @@ namespace GeekDesk.Util
             catch { }
         }
 
+        [System.Diagnostics.Conditional("DEBUG")]
         public static void WriteQuickSwitchLog(string msg)
         {
             try
