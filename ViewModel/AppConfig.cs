@@ -78,6 +78,8 @@ namespace GeekDesk.ViewModel
 
         private bool showBarIcon = true; //显示托盘图标  默认显示
 
+        private bool enableQuickSwitch = false; //Listary Quick Switch 文件夹跟随 默认关闭
+
         private bool doubleOpen = false; //双击打开项目  默认关闭
 
         private bool hoverMenu = false; //悬停切换菜单  默认关闭
@@ -417,6 +419,19 @@ namespace GeekDesk.ViewModel
             {
                 mouseMiddleShow = value;
                 OnPropertyChanged("MouseMiddleShow");
+            }
+        }
+
+        public bool EnableQuickSwitch
+        {
+            get
+            {
+                return enableQuickSwitch;
+            }
+            set
+            {
+                enableQuickSwitch = value;
+                OnPropertyChanged("EnableQuickSwitch");
             }
         }
 

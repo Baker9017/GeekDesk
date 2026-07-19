@@ -329,6 +329,21 @@ namespace GeekDesk.Control.UserControls.Config
         }
 
         /// <summary>
+        /// 启用/禁用 Quick Switch 文件夹跟随
+        /// </summary>
+        private void EnableQuickSwitch_Changed(object sender, RoutedEventArgs e)
+        {
+            if (appConfig.EnableQuickSwitch)
+            {
+                QuickSwitchThread.Hook();
+            }
+            else
+            {
+                QuickSwitchThread.Dispose();
+            }
+        }
+
+        /// <summary>
         /// 启用热键
         /// </summary>
         /// <param name="sender"></param>

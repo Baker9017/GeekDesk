@@ -437,6 +437,12 @@ namespace GeekDesk
                 MouseHookThread.Hook();
             }
 
+            //注册 Quick Switch 文件夹跟随监听
+            if (appData.AppConfig.EnableQuickSwitch)
+            {
+                QuickSwitchThread.Hook();
+            }
+
             //显秒插件
             if (appData.AppConfig.SecondsWindow == true)
             {
@@ -962,6 +968,10 @@ namespace GeekDesk
             if (appData.AppConfig.EnableEveryThing == true)
             {
                 EveryThingUtil.DisableEveryThing();
+            }
+            if (appData.AppConfig.EnableQuickSwitch)
+            {
+                QuickSwitchThread.Dispose();
             }
             Application.Current.Shutdown();
         }

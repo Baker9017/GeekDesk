@@ -21,6 +21,7 @@ namespace GeekDesk.MyThread
                 Dispatcher.Run();
             });
             thread.IsBackground = true;
+            thread.SetApartmentState(ApartmentState.STA);
             thread.Start();
             manualResetEvent.WaitOne();
             manualResetEvent.Dispose();

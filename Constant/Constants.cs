@@ -36,6 +36,8 @@ namespace GeekDesk.Constant
 
         public static string ERROR_FILE_PATH = APP_DIR + "logs\\error.log"; // 错误日志
 
+        public static string QUICK_SWITCH_LOG_PATH = APP_DIR + "logs\\quickswitch.log"; // QuickSwitch 诊断日志
+
         /// <summary>
         /// 插件文件夹
         /// </summary>

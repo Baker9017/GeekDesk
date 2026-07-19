@@ -152,6 +152,8 @@
     <Reference Include="WindowsAPICodePack.Shell.CommonFileDialogs, Version=1.1.5.0, Culture=neutral, processorArchitecture=MSIL">
       <HintPath>packages\WindowsAPICodePack.Shell.CommonFileDialogs.1.1.5\lib\net452\WindowsAPICodePack.Shell.CommonFileDialogs.dll</HintPath>
     </Reference>
+    <Reference Include="UIAutomationClient" />
+    <Reference Include="UIAutomationTypes" />
     <Reference Include="WindowsBase" />
     <Reference Include="PresentationCore" />
     <Reference Include="PresentationFramework" />
@@ -309,6 +311,8 @@
     <Compile Include="Util\DefaultIcons.cs" />
     <Compile Include="Util\DragAdorner.cs" />
     <Compile Include="Util\FileWatcher.cs" />
+    <Compile Include="Util\QuickSwitchUtil.cs" />
+    <Compile Include="MyThread\QuickSwitchThread.cs" />
     <Compile Include="Util\GlobalHotKey.cs" />
     <Compile Include="Util\CommonCode.cs" />
     <Compile Include="Util\FileIcon.cs" />

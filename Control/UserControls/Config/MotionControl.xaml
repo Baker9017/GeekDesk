@@ -41,6 +41,18 @@
                           Click="MouseMiddle_Changed" IsChecked="{Binding MouseMiddleShow}"/>
             </hc:UniformSpacingPanel>
 
+            <hc:UniformSpacingPanel Spacing="10" Margin="10,5,0,0" Grid.ColumnSpan="4">
+                <CheckBox Style="{StaticResource MyCheckBoxStyle}"
+                          x:Name="EnableQuickSwitchBox"
+                          Content="文件夹跟随 (Quick Switch)"
+                          Click="EnableQuickSwitch_Changed"
+                          IsChecked="{Binding EnableQuickSwitch}"
+                          hc:Poptip.HitMode="None"
+                          hc:Poptip.IsOpen="{Binding IsMouseOver, RelativeSource={RelativeSource Self}}"
+                          hc:Poptip.Content="第三方应用弹出文件对话框时,自动跳转到资源管理器当前路径"
+                          hc:Poptip.Placement="Top"/>
+            </hc:UniformSpacingPanel>
+
             <hc:UniformSpacingPanel Spacing="10" Margin="10,5,0,0"  Grid.ColumnSpan="4">
                 <CheckBox Style="{StaticResource MyCheckBoxStyle}" 
                           Content="双击启动" IsChecked="{Binding DoubleOpen}"/>
