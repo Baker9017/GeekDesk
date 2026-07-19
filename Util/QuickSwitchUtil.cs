@@ -21,232 +21,130 @@ namespace GeekDesk.Util
     {
         #region Shell COM (读取 Explorer 路径)
 
-        // Win10/Win11 上 UI Automation 读取地址栏 Edit 经常拿不到 ValuePattern,
-        // 而 Shell COM (IShellWindows -> IWebBrowserApp.LocationURL) 是稳定的备用通道.
-        // 我们直接走 IDispatch 调度, 不引用 SHDocVw 程序集.
-
-        [DllImport("ole32.dll")]
-        private static extern int CoCreateInstance(ref Guid rclsid, IntPtr pUnkOuter, uint dwClsContext, ref Guid riid, out IntPtr ppv);
-
-        [DllImport("oleaut32.dll")]
-        private static extern int VariantClear(IntPtr pVarg);
+        // 通过 Type.GetTypeFromCLSID + Activator.CreateInstance 访问 IShellWindows,
+        // 再用 InvokeMember 反射调用属性/方法 (late binding)。
+        // 不使用 CoCreateInstance + 手动 IDispatch vtable——IShellWindows 的进程外 proxy
+        // 在 Win10/11 上调用 GetIDsOfNames 会返回 DISP_E_UNKNOWNNAME, 永远无法读取属性名。
 
         // MSAA (Microsoft Active Accessibility) 备用路径.
         [DllImport("oleacc.dll")]
         private static extern int AccessibleObjectFromWindow(IntPtr hwnd, uint dwId, ref Guid riid, out IntPtr ppvObject);
 
         private static readonly Guid IID_IAccessible = new Guid("618736E0-3C3D-11CF-810C-02803C1174A1");
-        // IWebBrowserApp - 直接请求这个接口, 拿到后用 IDispatch 调度 LocationURL.
+        // IWebBrowserApp - 用于 MSAA 备用路径读取 LocationURL.
         private static readonly Guid IID_IWebBrowserApp = new Guid("0002DF05-0000-0000-C000-000000000046");
-        // IServiceProvider - 用于在 IE/Explorer 浏览器对象上查询子接口.
-        private static readonly Guid IID_IServiceProvider = new Guid("6D5140C1-7436-11CE-8034-00AA006009FA");
-        // IShellBrowser - 用来枚举当前 tab.
-        private static readonly Guid IID_IShellBrowser = new Guid("C08AFD90-F2A1-11D1-8455-00A0C91F3880");
-        // IID_IHlinkFrame (备选) etc.
-        // OBJID_WINDOW 用类里已经声明的 public const
 
         private static readonly Guid CLSID_ShellWindows = new Guid("9BA05972-F6A8-11CF-A442-00A0C90A8F39");
-        // IShellWindows 是 dispinterface, 直接通过 IID_IShellWindows (继承 IDispatch) 创建会返回 E_NOINTERFACE.
-        // 改用 IID_IDispatch 创建, 拿到的是 dispatch 指针, 用 GetIDsOfNames/Invoke 调度.
         private static readonly Guid IID_IDispatch = new Guid("00020400-0000-0000-C000-000000000046");
         private static readonly Guid IID_IUnknown = new Guid("00000000-0000-0000-C000-000000000046");
-        private const uint CLSCTX_LOCAL_SERVER = 0x4;
-        private const uint CLSCTX_INPROC_SERVER = 0x1;
-        private const uint CLSCTX_ALL = 0x17;
-
-        [Flags]
-        private enum DispatchFlags : ushort
-        {
-            DISPATCH_METHOD = 0x1,
-            DISPATCH_PROPERTYGET = 0x2,
-            DISPATCH_PROPERTYPUT = 0x4,
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct DISPPARAMS
-        {
-            public IntPtr rgvarg;
-            public IntPtr rgdispidNamedArgs;
-            public uint cArgs;
-            public uint cNamedArgs;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct EXCEPINFO
-        {
-            public ushort wCode;
-            public ushort wReserved1;
-            public ushort wReserved2;
-            public ushort wReserved3;
-            [MarshalAs(UnmanagedType.BStr)] public string bstrSource;
-            [MarshalAs(UnmanagedType.BStr)] public string bstrDescription;
-            [MarshalAs(UnmanagedType.BStr)] public string bstrHelpFile;
-            public uint dwHelpContext;
-            public IntPtr pfnDeferredFillIn;
-            public IntPtr scode;
-        }
-
-        // 走 IDispatch vtable (GetIDsOfNames / Invoke)
-        [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("00020400-0000-0000-C000-000000000046")]
-        private interface IDispatch
-        {
-            [PreserveSig] int GetTypeInfoCount(out uint pctinfo);
-            [PreserveSig] int GetTypeInfo(uint iTInfo, int lcid, out IntPtr ppTInfo);
-            [PreserveSig] int GetIDsOfNames(ref Guid riid, [MarshalAs(UnmanagedType.LPArray)] string[] rgszNames, uint cNames, int lcid, [MarshalAs(UnmanagedType.LPArray)] int[] rgDispId);
-            [PreserveSig] int Invoke(int dispIdMember, ref Guid riid, int lcid, DispatchFlags wFlags, ref DISPPARAMS pDispParams, out IntPtr pVarResult, ref EXCEPINFO pExcepInfo, out uint puArgErr);
-        }
 
         /// <summary>
         /// 通过 Shell COM (IShellWindows) 获取某个指定 Explorer 窗口 (targetHwnd!=0)
         /// 或任意可见 Explorer 窗口 (targetHwnd==0) 的当前路径。
         /// 必须在 STA 线程上调用。失败返回 null。
+        ///
+        /// 注意: 使用 Activator.CreateInstance + InvokeMember (late binding) 而非手动 IDispatch
+        /// vtable 调用。IShellWindows 是进程外 COM 对象, 其 proxy/stub 的 GetIDsOfNames 在
+        /// Win10/11 上返回 DISP_E_UNKNOWNNAME (0x80020001), 导致手动 vtable 方式永远失败。
+        /// .NET 的 InvokeMember 走自己的 COM 互操作层, 可以正确解析属性名。
         /// </summary>
         public static string GetExplorerPathViaShell(IntPtr targetHwnd)
         {
-            IntPtr shellWindowsPtr = IntPtr.Zero;
+            object shellWindows = null;
             try
             {
-                Guid clsidShell = CLSID_ShellWindows;
-                Guid iidUnknown = IID_IUnknown;
-                int hr = CoCreateInstance(ref clsidShell, IntPtr.Zero, CLSCTX_ALL,
-                    ref iidUnknown, out shellWindowsPtr);
-                LogUtil.WriteQuickSwitchLog("GetExplorerPathViaShell: CoCreateInstance hr=0x" + hr.ToString("X") + " ptr=" + shellWindowsPtr.ToString("X"));
-                if (hr != 0 || shellWindowsPtr == IntPtr.Zero)
+                Type shellWindowsType = Type.GetTypeFromCLSID(CLSID_ShellWindows);
+                if (shellWindowsType == null)
                 {
+                    LogUtil.WriteQuickSwitchLog("GetExplorerPathViaShell: Type.GetTypeFromCLSID returned null");
                     return null;
                 }
 
-                IntPtr dispatchPtr;
-                Guid iidDispatch = IID_IDispatch;
-                int hrQi = Marshal.QueryInterface(shellWindowsPtr, ref iidDispatch, out dispatchPtr);
-                Marshal.Release(shellWindowsPtr);
-                LogUtil.WriteQuickSwitchLog("GetExplorerPathViaShell: QI(IDispatch) hr=0x" + hrQi.ToString("X") + " ptr=" + dispatchPtr.ToString("X"));
-                if (hrQi != 0 || dispatchPtr == IntPtr.Zero)
+                shellWindows = Activator.CreateInstance(shellWindowsType);
+                if (shellWindows == null)
                 {
+                    LogUtil.WriteQuickSwitchLog("GetExplorerPathViaShell: Activator.CreateInstance returned null");
                     return null;
                 }
 
-                var shellWindows = (IDispatch)Marshal.GetObjectForIUnknown(dispatchPtr);
-                Marshal.Release(dispatchPtr);
-                if (shellWindows == null) return null;
-
+                int count;
                 try
                 {
-                    int[] dispIds = new int[1];
-                    Guid g = IID_IUnknown;
+                    count = (int)shellWindows.GetType().InvokeMember("Count",
+                        System.Reflection.BindingFlags.GetProperty, null, shellWindows, null);
+                }
+                catch (Exception ex)
+                {
+                    LogUtil.WriteQuickSwitchLog("GetExplorerPathViaShell: get Count EX: " + ex.Message);
+                    return null;
+                }
 
-                    // Count
-                    int hrCountNames = shellWindows.GetIDsOfNames(ref g, new string[] { "Count" }, 1, 0, dispIds);
-                    if (hrCountNames != 0)
+                LogUtil.WriteQuickSwitchLog("GetExplorerPathViaShell: ShellWindows.Count = " + count);
+                if (count <= 0) return null;
+
+                for (int i = 0; i < count; i++)
+                {
+                    object item = null;
+                    try
                     {
-                        LogUtil.WriteQuickSwitchLog("GetExplorerPathViaShell: GetIDsOfNames(Count) hr=0x" + hrCountNames.ToString("X"));
-                        return null;
-                    }
-                    IntPtr varResult;
-                    EXCEPINFO ex = new EXCEPINFO();
-                    uint argErr;
-                    DISPPARAMS p = new DISPPARAMS();
-                    int hrCount = shellWindows.Invoke(dispIds[0], ref g, 0, DispatchFlags.DISPATCH_PROPERTYGET,
-                            ref p, out varResult, ref ex, out argErr);
-                    LogUtil.WriteQuickSwitchLog("GetExplorerPathViaShell: Invoke(Count) hr=0x" + hrCount.ToString("X") + " var=" + (varResult == IntPtr.Zero ? "0" : "set"));
-                    if (hrCount != 0 || varResult == IntPtr.Zero)
-                    {
-                        LogUtil.WriteQuickSwitchLog("  excep wCode=0x" + ex.wCode.ToString("X") + " source=" + (ex.bstrSource ?? "null") + " desc=" + (ex.bstrDescription ?? "null"));
-                        return null;
-                    }
-                    int count = Marshal.ReadInt32(varResult, 8); // variant VT_I4 @ offset 8
-                    VariantClear(varResult);
+                        item = shellWindows.GetType().InvokeMember("Item",
+                            System.Reflection.BindingFlags.InvokeMethod, null, shellWindows, new object[] { i });
+                        if (item == null) continue;
 
-                    LogUtil.WriteQuickSwitchLog("GetExplorerPathViaShell: ShellWindows.Count = " + count);
-                    if (count <= 0) return null;
-
-                    if (shellWindows.GetIDsOfNames(ref g, new string[] { "Item" }, 1, 0, dispIds) != 0)
-                        return null;
-
-                    for (int i = 0; i < count; i++)
-                    {
-                        IntPtr itemResult = IntPtr.Zero;
-                        IntPtr vIdx = IntPtr.Zero;
+                        // 读取 HWND
+                        IntPtr shellHwnd;
                         try
                         {
-                            vIdx = Marshal.AllocHGlobal(16);
-                            Marshal.WriteInt16(vIdx, 0, 3);   // VT_I4
-                            Marshal.WriteInt16(vIdx, 2, 0);
-                            Marshal.WriteInt32(vIdx, 8, i);
-                            p = new DISPPARAMS { rgvarg = vIdx, cArgs = 1 };
-                            if (shellWindows.Invoke(dispIds[0], ref g, 0, DispatchFlags.DISPATCH_METHOD,
-                                    ref p, out itemResult, ref ex, out argErr) != 0 || itemResult == IntPtr.Zero)
+                            object hwndObj = item.GetType().InvokeMember("HWND",
+                                System.Reflection.BindingFlags.GetProperty, null, item, null);
+                            shellHwnd = new IntPtr(Convert.ToInt64(hwndObj));
+                        }
+                        catch { continue; }
+
+                        if (targetHwnd != IntPtr.Zero)
+                        {
+                            if (shellHwnd != targetHwnd) continue;
+                        }
+                        else
+                        {
+                            if (shellHwnd == IntPtr.Zero || !IsWindow(shellHwnd) || !IsWindowVisible(shellHwnd))
                                 continue;
-
-                            var item = (IDispatch)Marshal.GetObjectForIUnknown(itemResult);
-                            if (item == null) { Marshal.Release(itemResult); continue; }
-
-                            try
-                            {
-                                // HWND
-                                int[] subIds = new int[1];
-                                if (item.GetIDsOfNames(ref g, new string[] { "HWND" }, 1, 0, subIds) != 0) continue;
-                                IntPtr hwVar;
-                                DISPPARAMS pp = new DISPPARAMS();
-                                if (item.Invoke(subIds[0], ref g, 0, DispatchFlags.DISPATCH_PROPERTYGET,
-                                        ref pp, out hwVar, ref ex, out argErr) != 0 || hwVar == IntPtr.Zero)
-                                    continue;
-                                IntPtr shellHwnd = new IntPtr(Marshal.ReadInt32(hwVar, 8));
-                                VariantClear(hwVar);
-
-                                if (targetHwnd != IntPtr.Zero)
-                                {
-                                    if (shellHwnd != targetHwnd) continue;
-                                }
-                                else
-                                {
-                                    if (shellHwnd == IntPtr.Zero || !IsWindow(shellHwnd) || !IsWindowVisible(shellHwnd))
-                                        continue;
-                                }
-
-                                // LocationURL
-                                if (item.GetIDsOfNames(ref g, new string[] { "LocationURL" }, 1, 0, subIds) != 0) continue;
-                                IntPtr urlVar;
-                                if (item.Invoke(subIds[0], ref g, 0, DispatchFlags.DISPATCH_PROPERTYGET,
-                                        ref pp, out urlVar, ref ex, out argErr) != 0 || urlVar == IntPtr.Zero)
-                                    continue;
-                                string url = (string)Marshal.GetObjectForNativeVariant(urlVar);
-                                VariantClear(urlVar);
-
-                                if (string.IsNullOrEmpty(url)) continue;
-                                string path = UrlToPath(url);
-                                if (!string.IsNullOrEmpty(path) && IsValidPath(path))
-                                {
-                                    return path;
-                                }
-                            }
-                            finally
-                            {
-                                Marshal.ReleaseComObject(item);
-                            }
                         }
-                        catch (Exception ex2)
+
+                        // 读取 LocationURL
+                        string url;
+                        try
                         {
-                            LogUtil.WriteQuickSwitchLog("GetExplorerPathViaShell item EX: " + ex2.Message);
+                            url = (string)item.GetType().InvokeMember("LocationURL",
+                                System.Reflection.BindingFlags.GetProperty, null, item, null);
                         }
-                        finally
+                        catch { continue; }
+
+                        if (string.IsNullOrEmpty(url)) continue;
+                        string path = UrlToPath(url);
+                        if (!string.IsNullOrEmpty(path) && IsValidPath(path))
                         {
-                            if (vIdx != IntPtr.Zero) Marshal.FreeHGlobal(vIdx);
-                            if (itemResult != IntPtr.Zero)
-                            {
-                                try { Marshal.Release(itemResult); } catch { }
-                            }
+                            LogUtil.WriteQuickSwitchLog("GetExplorerPathViaShell: found path=" + path + " hwnd=0x" + shellHwnd.ToString("X"));
+                            return path;
                         }
                     }
-                }
-                finally
-                {
-                    Marshal.ReleaseComObject(shellWindows);
+                    catch (Exception ex)
+                    {
+                        LogUtil.WriteQuickSwitchLog("GetExplorerPathViaShell item[" + i + "] EX: " + ex.Message);
+                    }
+                    finally
+                    {
+                        if (item != null) try { Marshal.ReleaseComObject(item); } catch { }
+                    }
                 }
             }
             catch (Exception ex)
             {
                 LogUtil.WriteQuickSwitchLog("GetExplorerPathViaShell EX: " + ex.Message);
+            }
+            finally
+            {
+                if (shellWindows != null) try { Marshal.ReleaseComObject(shellWindows); } catch { }
             }
             return null;
         }
