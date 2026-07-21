@@ -45,6 +45,10 @@ namespace GeekDesk.MyThread
 
         private static System.Windows.Threading.DispatcherTimer _pumpTimer;
 
+        // 文件夹对话框专用: 记录哪些对话框是文件夹选择对话框（避免卡死）
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<IntPtr, bool> _folderDialogs
+            = new System.Collections.Concurrent.ConcurrentDictionary<IntPtr, bool>();
+
         // ─────────────────────────── 生命周期 ───────────────────────────
 
         public static void Hook()
@@ -262,7 +266,11 @@ namespace GeekDesk.MyThread
                     // 原子地取走待注入路径; 若已被其他路径更新则放弃本次 (下次焦点再应用)
                     string pending;
                     if (!_pendingPaths.TryRemove(hwnd, out pending) || string.IsNullOrEmpty(pending))
+                    {
+                        LogUtil.WriteQuickSwitchLog("DialogFocus: no pending path for dlg=0x" + hwnd.ToString("X")
+                            + " (先切到资源管理器再切回对话框才会触发注入)");
                         return;
+                    }
 
                     LogUtil.WriteQuickSwitchLog("DialogFocus: applying pending"
                         + " dlg=0x" + hwnd.ToString("X") + " path=" + pending);
@@ -330,13 +338,21 @@ namespace GeekDesk.MyThread
             bool wasEmpty = QuickSwitchUtil.TrackedDialogs.IsEmpty;
             QuickSwitchUtil.TrackedDialogs[hwnd] = "";
 
+            // 检测是否为文件夹选择对话框
+            bool isFolderDialog = QuickSwitchUtil.IsFolderDialog(hwnd);
+            _folderDialogs[hwnd] = isFolderDialog;
+            if (isFolderDialog)
+            {
+                LogUtil.WriteQuickSwitchLog("OpenDialog: folder dialog detected hwnd=0x" + hwnd.ToString("X"));
+            }
+
             // 第一个对话框打开 → 启动 Explorer 监控
             if (wasEmpty) StartExplorerHook();
 
             // 不注入初始路径: 保持应用原有路径不变,
             // 等待用户先操作资源管理器再切回对话框时再注入 (延迟注入流程).
             LogUtil.WriteQuickSwitchLog("OpenDialog: registered (no initial inject)"
-                + " hwnd=0x" + hwnd.ToString("X"));
+                + " hwnd=0x" + hwnd.ToString("X") + " isFolder=" + isFolderDialog);
         }
 
         /// <summary>
@@ -349,6 +365,7 @@ namespace GeekDesk.MyThread
 
             QuickSwitchUtil.TrackedDialogs.TryRemove(hwnd, out _);
             _pendingPaths.TryRemove(hwnd, out _);
+            _folderDialogs.TryRemove(hwnd, out _);
 
             // 所有对话框关闭 → 停止 Explorer 监控
             if (QuickSwitchUtil.TrackedDialogs.IsEmpty) StopExplorerHook();
@@ -368,7 +385,23 @@ namespace GeekDesk.MyThread
 
         private static void TryInject(IntPtr hwnd, string path)
         {
-            try { QuickSwitchUtil.TryInject(hwnd, path); }
+            try
+            {
+                bool isFolder = _folderDialogs.TryGetValue(hwnd, out bool f) && f;
+                LogUtil.WriteQuickSwitchLog("TryInject: hwnd=0x" + hwnd.ToString("X")
+                    + " isFolder=" + isFolder + " path=" + path);
+
+                if (isFolder)
+                {
+                    bool ok = QuickSwitchUtil.TryInjectFolderDialog(hwnd, path);
+                    LogUtil.WriteQuickSwitchLog("TryInject: TryInjectFolderDialog result=" + ok);
+                }
+                else
+                {
+                    bool ok = QuickSwitchUtil.TryInject(hwnd, path);
+                    LogUtil.WriteQuickSwitchLog("TryInject: TryInject result=" + ok);
+                }
+            }
             catch (Exception ex) { LogUtil.WriteErrorLog(ex, "QuickSwitch 注入异常"); }
         }
     }

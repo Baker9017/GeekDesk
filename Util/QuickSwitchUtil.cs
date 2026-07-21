@@ -19,6 +19,356 @@ namespace GeekDesk.Util
     /// </summary>
     public static class QuickSwitchUtil
     {
+        #region 文件夹对话框支持 (Folder Browser Dialog)
+
+        // 文件夹对话框有两种类型:
+        // 1. 旧式 SHBrowseForFolder (#32770, 树形视图, 无地址栏)
+        // 2. 新式 IFileOpenDialog + FOS_PICKFOLDERS (#32766, 有地址栏)
+        // 两者的处理策略完全不同.
+
+        // IFileDialog / IFileOpenDialog GUIDs (用于 COM 自动化)
+        // 来源: Windows SDK shobjidl_core.h / objbase.h
+        private static readonly Guid CLSID_FileOpenDialog  = new Guid("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7"); // shell32 CoCreateInstance CLSID
+        private static readonly Guid CLSID_FileSaveDialog  = new Guid("C0B4E2F3-BA21-4773-8BA9-9CAA42BE0B59");
+        private static readonly Guid IID_IFileDialog       = new Guid("42F85136-DB7E-439C-85F1-E4079D47506B"); // IFileDialog IID
+        private static readonly Guid IID_IFileOpenDialog   = new Guid("D57C7288-D4AD-4768-BE02-9D969532D960"); // IFileOpenDialog IID
+        private static readonly Guid IID_IShellItem        = new Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE"); // IShellItem IID
+
+        private const uint FOS_PICKFOLDERS = 0x00000020;
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        private static extern int SHCreateItemFromParsingName(
+            [MarshalAs(UnmanagedType.LPWStr)] string pszPath,
+            IntPtr pbc,
+            ref Guid riid,
+            [MarshalAs(UnmanagedType.Interface)] out object ppv);
+
+        /// <summary>
+        /// 判断对话框是否为文件夹选择对话框 (而非文件打开/保存对话框)。
+        /// 对于新式 CommonItemDialog (#32766)，尝试通过 COM 接口设置路径。
+        /// 对于旧式树形对话框，返回 false 表示跳过（避免卡死）。
+        /// </summary>
+        public static bool IsFolderDialog(IntPtr dialogHwnd)
+        {
+            if (dialogHwnd == IntPtr.Zero || !IsWindow(dialogHwnd)) return false;
+
+            string cls = GetClassNameString(dialogHwnd);
+
+            // 新式 CommonItemDialog (Windows Vista+)
+            if (cls == "#32766")
+            {
+                LogUtil.WriteQuickSwitchLog("IsFolderDialog: detected CommonItemDialog #32766 hwnd=0x"
+                    + dialogHwnd.ToString("X"));
+                return true;
+            }
+
+            // 旧式 SHBrowseForFolder (#32770): 检测是否只有树形控件，没有地址栏
+            if (cls == "#32770")
+            {
+                // 如果找不到 ComboBoxEx32 或地址栏 Edit，则认为是旧式文件夹对话框
+                IntPtr topmostComboEx = FindTopmostComboBoxEx32(dialogHwnd);
+                if (topmostComboEx == IntPtr.Zero)
+                {
+                    // 没有地址栏 ComboBoxEx，可能是旧式树形文件夹对话框
+                    LogUtil.WriteQuickSwitchLog("IsFolderDialog: no ComboBoxEx32 found, likely old-style folder dialog hwnd=0x"
+                        + dialogHwnd.ToString("X"));
+                    return true; // 标记为文件夹对话框，但不进行注入
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// 对文件夹选择对话框尝试注入路径。
+        /// 新式 CommonItemDialog (#32766) 使用 IFileDialog::SetFolder COM 接口。
+        /// 旧式对话框跳过注入，避免卡死。
+        /// </summary>
+        public static bool TryInjectFolderDialog(IntPtr dialogHwnd, string path)
+        {
+            if (string.IsNullOrEmpty(path) || !IsWindow(dialogHwnd)) return false;
+
+            string cls = GetClassNameString(dialogHwnd);
+
+            // 新式 CommonItemDialog (#32766)
+            if (cls == "#32766")
+            {
+                return TryInjectViaIFileDialog(dialogHwnd, path);
+            }
+
+            // 旧式 SHBrowseForFolder (#32770)
+            if (cls == "#32770")
+            {
+                IntPtr topmostComboEx = FindTopmostComboBoxEx32(dialogHwnd);
+                if (topmostComboEx == IntPtr.Zero)
+                {
+                    // 无地址栏 → 用 BFFM_SETSELECTION 让树形视图跳转
+                    LogUtil.WriteQuickSwitchLog("TryInjectFolderDialog: old-style tree dialog → BFFM_SETSELECTION hwnd=0x"
+                        + dialogHwnd.ToString("X") + " path=" + path);
+                    return TryInjectViaSetSelection(dialogHwnd, path);
+                }
+                // 有地址栏（BIF_USENEWUI 等带编辑框的旧式对话框）→ 正常注入
+                LogUtil.WriteQuickSwitchLog("TryInjectFolderDialog: old-style with ComboBoxEx → TryInject hwnd=0x"
+                    + dialogHwnd.ToString("X"));
+                return TryInject(dialogHwnd, path);
+            }
+
+            LogUtil.WriteQuickSwitchLog("TryInjectFolderDialog: unknown class '" + cls + "' hwnd=0x" + dialogHwnd.ToString("X"));
+            return false;
+        }
+
+        /// <summary>
+        /// 旧式 SHBrowseForFolder 路径跳转：通过 BFFM_SETSELECTION 消息驱动树形对话框。
+        /// <para>
+        /// BFFM_SETSELECTION = WM_USER + 103 (0x0467)。
+        /// wParam=1 (TRUE) 时 lParam 是目标进程内的 Unicode 路径指针。
+        /// OS 不对 WM_USER 消息做跨进程 marshal，必须手动
+        /// VirtualAllocEx + WriteProcessMemory 把字符串写入目标进程再发消息。
+        /// </para>
+        /// </summary>
+        private static bool TryInjectViaSetSelection(IntPtr dialogHwnd, string path)
+        {
+            if (string.IsNullOrEmpty(path) || !System.IO.Directory.Exists(path))
+            {
+                LogUtil.WriteQuickSwitchLog("TryInjectViaSetSelection: path invalid or not exist '" + path + "'");
+                return false;
+            }
+
+            GetWindowThreadProcessId(dialogHwnd, out uint targetPid);
+            LogUtil.WriteQuickSwitchLog("TryInjectViaSetSelection: pid=" + targetPid + " path=" + path);
+
+            // BFFM_SETSELECTION: WM_USER(0x0400) + 103 = 0x0467
+            // wParam = 1 (TRUE) → lParam 为 Unicode 路径字符串指针（目标进程内）
+            const int BFFM_SETSELECTION = 0x0467;
+
+            byte[] pathBytes = System.Text.Encoding.Unicode.GetBytes(path + "\0");
+
+            IntPtr hProcess = OpenProcess(PROCESS_VM_WRITE | PROCESS_VM_OPERATION, false, targetPid);
+            if (hProcess == IntPtr.Zero)
+            {
+                LogUtil.WriteQuickSwitchLog("TryInjectViaSetSelection: OpenProcess failed pid=" + targetPid
+                    + " err=" + Marshal.GetLastWin32Error());
+                return false;
+            }
+
+            IntPtr remoteBuffer = IntPtr.Zero;
+            try
+            {
+                remoteBuffer = VirtualAllocEx(hProcess, IntPtr.Zero, (uint)pathBytes.Length,
+                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (remoteBuffer == IntPtr.Zero)
+                {
+                    LogUtil.WriteQuickSwitchLog("TryInjectViaSetSelection: VirtualAllocEx failed err=" + Marshal.GetLastWin32Error());
+                    return false;
+                }
+
+                IntPtr written;
+                if (!WriteProcessMemory(hProcess, remoteBuffer, pathBytes, (uint)pathBytes.Length, out written))
+                {
+                    LogUtil.WriteQuickSwitchLog("TryInjectViaSetSelection: WriteProcessMemory failed err=" + Marshal.GetLastWin32Error());
+                    return false;
+                }
+
+                // 发送消息让树形对话框跳转
+                SendMessage(dialogHwnd, BFFM_SETSELECTION, (IntPtr)1, remoteBuffer);
+                LogUtil.WriteQuickSwitchLog("TryInjectViaSetSelection: BFFM_SETSELECTION sent OK → remotePtr=0x"
+                    + remoteBuffer.ToString("X") + " path=" + path);
+                return true;
+            }
+            finally
+            {
+                if (remoteBuffer != IntPtr.Zero)
+                    VirtualFreeEx(hProcess, remoteBuffer, 0, MEM_RELEASE);
+                CloseHandle(hProcess);
+            }
+        }
+
+        /// <summary>
+        /// 通过 IFileDialog COM 接口设置文件夹对话框的路径。
+        /// 这是最安全、最稳定的方式，不会导致 UI 卡死。
+        /// </summary>
+        private static bool TryInjectViaIFileDialog(IntPtr dialogHwnd, string path)
+        {
+            if (string.IsNullOrEmpty(path) || !System.IO.Directory.Exists(path))
+            {
+                LogUtil.WriteQuickSwitchLog("TryInjectViaIFileDialog: invalid path '" + path + "'");
+                return false;
+            }
+
+            try
+            {
+                // 获取对话框所属进程的 HWND 对应的 IFileDialog
+                // 方法: 通过 GetWindowThreadProcessId 获取进程 ID，
+                // 然后 CoGetObjectFromWindow 或其他方式获取 COM 对象
+                // 
+                // 更可靠的方法: 直接从顶层窗口获取 IDispatch，然后尝试 QueryInterface 到 IFileDialog
+                // 但这需要知道确切的接口偏移
+                //
+                // 简化方案: 使用 IShellItem 方式，Windows 会自动处理路径
+
+                object shellItem = null;
+                Guid iidShellItem = IID_IShellItem; // static readonly 不能直接作 ref 参数
+                int hr = SHCreateItemFromParsingName(path, IntPtr.Zero, ref iidShellItem, out shellItem);
+                if (hr != 0 || shellItem == null)
+                {
+                    LogUtil.WriteQuickSwitchLog("TryInjectViaIFileDialog: SHCreateItemFromParsingName failed hr=0x"
+                        + hr.ToString("X") + " path=" + path);
+                    return false;
+                }
+
+                // 获取前台窗口，如果是对话框则尝试设置
+                IntPtr fg = GetForegroundWindow();
+                if (fg == dialogHwnd || IsChildOf(dialogHwnd, fg))
+                {
+                    // 尝试发送消息让对话框导航到该路径
+                    // 对于 IFileDialog，可以在地址栏输入路径后发送回车
+                    LogUtil.WriteQuickSwitchLog("TryInjectViaIFileDialog: attempting UI automation for hwnd=0x"
+                        + dialogHwnd.ToString("X") + " path=" + path);
+
+                    // 使用 UI Automation 找到地址栏并设置路径
+                    return TryInjectViaUIAutomation(dialogHwnd, path);
+                }
+
+                LogUtil.WriteQuickSwitchLog("TryInjectViaIFileDialog: dialog not focused, skip hwnd=0x"
+                    + dialogHwnd.ToString("X"));
+                return false;
+            }
+            catch (Exception ex)
+            {
+                LogUtil.WriteQuickSwitchLog("TryInjectViaIFileDialog EX: " + ex.Message);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 通过 UI Automation 设置文件夹对话框的地址栏路径。
+        /// 适用于新式 CommonItemDialog。
+        /// </summary>
+        private static bool TryInjectViaUIAutomation(IntPtr dialogHwnd, string path)
+        {
+            try
+            {
+                AutomationElement element = AutomationElement.FromHandle(dialogHwnd);
+                if (element == null) return false;
+
+                // 查找地址栏 (通常是 ComboBox 或 Edit)
+                var combos = element.FindAll(TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ComboBox));
+                foreach (AutomationElement combo in combos)
+                {
+                    try
+                    {
+                        string name = combo.Current.Name ?? "";
+                        // 匹配常见的地址栏名称
+                        if (name.IndexOf("地址", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            name.IndexOf("Address", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            name.IndexOf("folder", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            // 尝试获取 ValuePattern
+                            var vp = combo.GetCurrentPattern(ValuePattern.Pattern) as ValuePattern;
+                            if (vp != null)
+                            {
+                                vp.SetValue(path);
+                                SendReturnKey(combo);
+                                LogUtil.WriteQuickSwitchLog("TryInjectViaUIAutomation: set path via ComboBox hwnd=0x"
+                                    + new IntPtr(combo.Current.NativeWindowHandle).ToString("X"));
+                                return true;
+                            }
+
+                            // 查找 ComboBox 内的 Edit
+                            var editInCombo = combo.FindFirst(TreeScope.Children,
+                                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit));
+                            if (editInCombo != null)
+                            {
+                                var vpEdit = editInCombo.GetCurrentPattern(ValuePattern.Pattern) as ValuePattern;
+                                if (vpEdit != null)
+                                {
+                                    vpEdit.SetValue(path);
+                                    SendReturnKey(editInCombo);
+                                    LogUtil.WriteQuickSwitchLog("TryInjectViaUIAutomation: set path via Edit in ComboBox");
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                // 备选: 找顶层 Edit 并检查其名称/位置
+                var edits = element.FindAll(TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit));
+                foreach (AutomationElement edit in edits)
+                {
+                    try
+                    {
+                        string name = edit.Current.Name ?? "";
+                        IntPtr editHwnd = new IntPtr(edit.Current.NativeWindowHandle);
+
+                        // 检查是否像地址栏 (路径格式)
+                        if (name.Length >= 3 && name[1] == ':' && name.Contains("\\"))
+                        {
+                            var vp = edit.GetCurrentPattern(ValuePattern.Pattern) as ValuePattern;
+                            if (vp != null)
+                            {
+                                vp.SetValue(path);
+                                SendReturnKey(edit);
+                                LogUtil.WriteQuickSwitchLog("TryInjectViaUIAutomation: set path via Edit name='"
+                                    + name + "' hwnd=0x" + editHwnd.ToString("X"));
+                                return true;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                LogUtil.WriteQuickSwitchLog("TryInjectViaUIAutomation: no address bar found in dialog");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                LogUtil.WriteQuickSwitchLog("TryInjectViaUIAutomation EX: " + ex.Message);
+                return false;
+            }
+        }
+
+        private static void SendReturnKey(AutomationElement element)
+        {
+            try
+            {
+                // ValuePattern.SetValue 后，模拟回车键触发地址栏导航
+                IntPtr hwnd = new IntPtr(element.Current.NativeWindowHandle);
+                const int WM_KEYDOWN = 0x0100;
+                const int WM_KEYUP = 0x0101;
+                const int VK_RETURN = 0x0D;
+                const int lParamKeyDown = 0x001C0001;
+                const int lParamKeyUp = unchecked((int)0xC01C0001);
+
+                SendMessage(hwnd, WM_KEYDOWN, (IntPtr)VK_RETURN, (IntPtr)lParamKeyDown);
+                SendMessage(hwnd, WM_KEYUP, (IntPtr)VK_RETURN, (IntPtr)lParamKeyUp);
+            }
+            catch { }
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool IsChild(IntPtr hWndParent, IntPtr hWnd);
+
+        private static bool IsChildOf(IntPtr parent, IntPtr child)
+        {
+            if (child == IntPtr.Zero) return false;
+            IntPtr current = child;
+            while (current != IntPtr.Zero)
+            {
+                if (current == parent) return true;
+                current = GetParent(current);
+            }
+            return false;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetParent(IntPtr hWnd);
+
+        #endregion
+
         #region Shell COM (读取 Explorer 路径)
 
         // 通过 Type.GetTypeFromCLSID + Activator.CreateInstance 访问 IShellWindows,
@@ -635,6 +985,33 @@ namespace GeekDesk.Util
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+        // ── kernel32: 跨进程内存写入 (用于 BFFM_SETSELECTION 注入) ──
+
+        private const uint PROCESS_VM_WRITE     = 0x0020;
+        private const uint PROCESS_VM_OPERATION = 0x0008;
+        private const uint MEM_COMMIT    = 0x00001000;
+        private const uint MEM_RESERVE   = 0x00002000;
+        private const uint MEM_RELEASE   = 0x00008000;
+        private const uint PAGE_READWRITE = 0x04;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress,
+            uint dwSize, uint flAllocationType, uint flProtect);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress,
+            byte[] lpBuffer, uint nSize, out IntPtr lpNumberOfBytesWritten);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool VirtualFreeEx(IntPtr hProcess, IntPtr lpAddress,
+            uint dwSize, uint dwFreeType);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
 
         #endregion
 
