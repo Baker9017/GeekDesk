@@ -15,7 +15,8 @@ namespace GeekDesk.MyThread
     /// 2. 延迟注入: Explorer 导航事件只把新路径记录为"待注入" (pending), 不立即
     ///    修改对话框. 当用户把焦点切回文件对话框 (EVENT_SYSTEM_FOREGROUND) 时才注入.
     ///
-    /// 3. 首次立即注入: 对话框刚打开时, 仍然立即注入当前 Explorer 路径, 保持跟随体验.
+    /// 3. 保持应用原路径: 对话框刚打开时不注入任何路径, 保留应用自身的初始路径.
+    ///    只有当用户在对话框打开后主动操作了资源管理器, 再切回对话框时才触发路径跟随.
     ///
     /// 4. 无轮询: 去掉了定时轮询线程, 完全由事件驱动.
     /// </summary>
@@ -316,7 +317,10 @@ namespace GeekDesk.MyThread
         }
 
         /// <summary>
-        /// 注册新打开的对话框, 惰性启动 Explorer hook, 并立即注入当前 Explorer 路径 (首次跟随).
+        /// 注册新打开的对话框, 惰性启动 Explorer hook.
+        /// 不注入初始路径 — 保留应用自身的初始路径.
+        /// 只有在对话框存活期间用户主动操作了资源管理器, 再切回对话框时 (ExplorerAndFocusCallback 情形 B)
+        /// 才会把新路径注入进来.
         /// 在 STA dispatcher 上调用.
         /// </summary>
         private static void OpenDialog(IntPtr hwnd)
@@ -329,19 +333,10 @@ namespace GeekDesk.MyThread
             // 第一个对话框打开 → 启动 Explorer 监控
             if (wasEmpty) StartExplorerHook();
 
-            // 立即注入当前 Explorer 路径 (首次跟随, 用户体验优先)
-            string initialPath = QuickSwitchUtil.GetLastExplorerPath();
-            if (!string.IsNullOrEmpty(initialPath) && QuickSwitchUtil.IsValidPath(initialPath))
-            {
-                LogUtil.WriteQuickSwitchLog("OpenDialog: initial inject"
-                    + " hwnd=0x" + hwnd.ToString("X") + " path=" + initialPath);
-                TryInject(hwnd, initialPath);
-                QuickSwitchUtil.TrackedDialogs[hwnd] = initialPath;
-            }
-            else
-            {
-                LogUtil.WriteQuickSwitchLog("OpenDialog: no initial path, hwnd=0x" + hwnd.ToString("X"));
-            }
+            // 不注入初始路径: 保持应用原有路径不变,
+            // 等待用户先操作资源管理器再切回对话框时再注入 (延迟注入流程).
+            LogUtil.WriteQuickSwitchLog("OpenDialog: registered (no initial inject)"
+                + " hwnd=0x" + hwnd.ToString("X"));
         }
 
         /// <summary>
