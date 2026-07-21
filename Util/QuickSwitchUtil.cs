@@ -575,6 +575,9 @@ namespace GeekDesk.Util
         private const int WM_KEYUP = 0x0101;
         private const int VK_RETURN = 0x0D;
 
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct RECT { public int Left, Top, Right, Bottom; }
+
         #endregion
 
         #region Win32 API
@@ -604,8 +607,15 @@ namespace GeekDesk.Util
         [DllImport("user32.dll")]
         public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
+        // WM_SETTEXT 版: lParam 为字符串
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         public static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, string lParam);
+
+        // 通用版: lParam 为 IntPtr (用于 WM_KEYDOWN / WM_KEYUP 等)
+        // 与上面的字符串重载共存。重要: 此版本绕过线程消息队列,
+        // IsDialogMessage 无法拦截, 直接将消息送达目标窗口的 WndProc。
+        [DllImport("user32.dll")]
+        public static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
 
         [DllImport("user32.dll")]
         public static extern bool PostMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
@@ -621,6 +631,10 @@ namespace GeekDesk.Util
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
 
         #endregion
 
@@ -924,12 +938,33 @@ namespace GeekDesk.Util
 
             try
             {
+                // 1. 写入地址栏文本
                 IntPtr setTextResult = SendMessage(editHwnd, WM_SETTEXT, IntPtr.Zero, path);
-                bool postDown = PostMessage(editHwnd, WM_KEYDOWN, (IntPtr)VK_RETURN, IntPtr.Zero);
-                bool postUp = PostMessage(editHwnd, WM_KEYUP, (IntPtr)VK_RETURN, IntPtr.Zero);
+
+                // 2. 触发地址栏导航: 必须用 SendMessage 而非 PostMessage。
+                //
+                //    PostMessage 把消息放入线程消息队列; 对话框消息循环会先用
+                //    IsDialogMessage 扫描队列, 看到 VK_RETURN 就直接激活默认按钮
+                //    (Save/OK), 消息根本不会送达地址栏 Edit 的 WndProc ——
+                //    这正是 Word/Excel 另存为触发 QuickSwitch 后直接保存文件并
+                //    退出对话框的根本原因。
+                //
+                //    SendMessage 直接调用目标窗口的 WndProc (内核同步调用),
+                //    完全绕过线程消息队列, IsDialogMessage 无从介入。
+                //    Shell 地址栏子类化的 WndProc 收到 VK_RETURN 后触发目录导航,
+                //    对话框保持打开状态。
+                //
+                // lParam 说明:
+                //   WM_KEYDOWN: 0x001C0001 = scan_code(0x1C) | repeat(1)
+                //   WM_KEYUP  : 0xC01C0001 = transition(1)<<31 | prev_state(1)<<30
+                //               | scan_code(0x1C) | repeat(1)
+                const int lParamKeyDown = 0x001C0001;
+                const int lParamKeyUp   = unchecked((int)0xC01C0001);
+                SendMessage(editHwnd, WM_KEYDOWN, (IntPtr)VK_RETURN, (IntPtr)lParamKeyDown);
+                SendMessage(editHwnd, WM_KEYUP,   (IntPtr)VK_RETURN, (IntPtr)lParamKeyUp);
+
                 LogUtil.WriteQuickSwitchLog("TryInject: OK dialog=0x" + dialogHwnd.ToString("X") + " edit=0x" + editHwnd.ToString("X")
                     + " SetTextRet=" + setTextResult.ToInt64()
-                    + " PostDown=" + postDown + " PostUp=" + postUp
                     + " path=" + path);
                 return true;
             }
@@ -956,14 +991,47 @@ namespace GeekDesk.Util
 
         /// <summary>
         /// 在 #32770 子窗口树中查找地址栏 Edit。
-        /// 优先按"文本内容是路径"的 Edit 匹配 (兼容 Win10 老 / Win11 新两种对话框),
-        /// 然后退化到 ComboBoxEx32 → ComboBox → Edit 链, 最后 fallback 到第一个 Edit。
+        ///
+        /// 优先级:
+        ///   ① Y 坐标最靠上的 ComboBoxEx32 → ComboBox → Edit  (最可靠, 最优先)
+        ///      地址栏始终位于对话框顶部; 文件名框始终位于底部。
+        ///      旧式对话框 (GetOpenFileName 等) 中, 地址栏与文件名框都是 ComboBoxEx32,
+        ///      按 Z 序找第一个不可靠 (文件名框可能排在前面); 按屏幕 Y 坐标取最靠上的,
+        ///      可跨所有版本准确命中地址栏。
+        ///   ② UI Automation 扫描内容像路径的 Edit (次选)
+        ///      过滤: 路径末段含 "." 的跳过 (文件名.ext 特征), 防止 Word/Excel 另存为
+        ///      的文件名框 (预填完整路径如 "C:\...\文档.docx") 被误命中。
+        ///   ③ 顶层 ComboBox → Edit 链 (Win11 新对话框兜底)
+        ///   ④ 第一个 Edit (最后兜底)
+        ///
         /// 必须在 STA 线程上调用 (UI Automation 需要 STA COM apartment)。
         /// </summary>
         public static IntPtr FindAddressEdit(IntPtr dialogHwnd)
         {
-            var candidates = new System.Collections.Generic.List<KeyValuePair<IntPtr, string>>();
+            // ① 按屏幕 Y 坐标找最靠上的 ComboBoxEx32 → ComboBox → Edit
+            IntPtr topmostComboEx = FindTopmostComboBoxEx32(dialogHwnd);
+            if (topmostComboEx != IntPtr.Zero)
+            {
+                IntPtr combo = FindFirstChildByClass(topmostComboEx, "ComboBox");
+                if (combo != IntPtr.Zero)
+                {
+                    IntPtr edit = FindFirstChildByClass(combo, "Edit");
+                    if (edit != IntPtr.Zero)
+                    {
+                        string text = GetEditText(edit);
+                        if (!IsFilenameEditContent(text))
+                        {
+                            LogUtil.WriteQuickSwitchLog("FindAddressEdit: topmost ComboBoxEx32 Edit hwnd=0x"
+                                + edit.ToString("X") + " text='" + text + "'");
+                            return edit;
+                        }
+                        LogUtil.WriteQuickSwitchLog("FindAddressEdit: topmost ComboBoxEx32 Edit looks like filename, skip: '" + text + "'");
+                    }
+                }
+            }
 
+            // ② UI Automation 扫描 (次选; 无 ComboBoxEx32 或 ① 校验未通过时使用)
+            var candidates = new System.Collections.Generic.List<KeyValuePair<IntPtr, string>>();
             try
             {
                 AutomationElement element = AutomationElement.FromHandle(dialogHwnd);
@@ -993,10 +1061,15 @@ namespace GeekDesk.Util
 
                             candidates.Add(new KeyValuePair<IntPtr, string>(h, text ?? ""));
 
-                            // 命中: Edit 文本看起来像路径 (含 drive letter + "\\")
+                            // 命中: 路径格式 (drive letter + \\, 无通配符) 且不像文件名框
                             if (!string.IsNullOrEmpty(text) && text.Length >= 3
                                 && text[1] == ':' && text.Contains("\\") && !text.Contains("?") && !text.Contains("*"))
                             {
+                                if (IsFilenameEditContent(text))
+                                {
+                                    LogUtil.WriteQuickSwitchLog("FindAddressEdit: skip filename field '" + text + "' hwnd=0x" + h.ToString("X"));
+                                    continue;
+                                }
                                 LogUtil.WriteQuickSwitchLog("FindAddressEdit: matched by text '" + text + "' hwnd=0x" + h.ToString("X"));
                                 return h;
                             }
@@ -1013,35 +1086,19 @@ namespace GeekDesk.Util
                 LogUtil.WriteQuickSwitchLog("FindAddressEdit UI Automation EX: " + ex.Message);
             }
 
-            // 退化: 遍历 ComboBoxEx32 -> ComboBox -> Edit 链
-            IntPtr comboEx = FindFirstChildByClass(dialogHwnd, "ComboBoxEx32");
-            if (comboEx != IntPtr.Zero)
-            {
-                IntPtr combo = FindFirstChildByClass(comboEx, "ComboBox");
-                if (combo != IntPtr.Zero)
-                {
-                    IntPtr edit = FindFirstChildByClass(combo, "Edit");
-                    if (edit != IntPtr.Zero)
-                    {
-                        LogUtil.WriteQuickSwitchLog("FindAddressEdit: matched by ComboBoxEx32 chain hwnd=0x" + edit.ToString("X"));
-                        return edit;
-                    }
-                }
-            }
-
-            // 再退化: 顶层 ComboBox -> Edit (Win11 新对话框)
+            // ③ 顶层 ComboBox → Edit (Win11 新对话框兜底)
             IntPtr topCombo = FindFirstChildByClass(dialogHwnd, "ComboBox");
             if (topCombo != IntPtr.Zero)
             {
                 IntPtr edit = FindFirstChildByClass(topCombo, "Edit");
                 if (edit != IntPtr.Zero)
                 {
-                    LogUtil.WriteQuickSwitchLog("FindAddressEdit: matched by ComboBox->Edit chain hwnd=0x" + edit.ToString("X"));
+                    LogUtil.WriteQuickSwitchLog("FindAddressEdit: ComboBox->Edit chain hwnd=0x" + edit.ToString("X"));
                     return edit;
                 }
             }
 
-            // 最后一搏: 取第一个 Edit (可能错给文件名框, 但起码不会注入失败)
+            // ④ 最后兜底: 第一个 Edit
             foreach (var kv in candidates)
             {
                 if (kv.Key != IntPtr.Zero)
@@ -1053,6 +1110,51 @@ namespace GeekDesk.Util
 
             LogUtil.WriteQuickSwitchLog("FindAddressEdit: NO Edit found in dialog 0x" + dialogHwnd.ToString("X") + " (candidates=" + candidates.Count + ")");
             return IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// 在对话框所有后代中，按屏幕 Y 坐标找到最靠上的 ComboBoxEx32。
+        /// 文件对话框地址栏 (顶部) 与文件名框 (底部) 都使用 ComboBoxEx32,
+        /// Y 最小 = 最靠上 = 地址栏。
+        /// </summary>
+        private static IntPtr FindTopmostComboBoxEx32(IntPtr dialogHwnd)
+        {
+            IntPtr best = IntPtr.Zero;
+            int bestTop = int.MaxValue;
+            try
+            {
+                EnumChildWindows(dialogHwnd, (hwnd, lParam) =>
+                {
+                    if (GetClassNameString(hwnd) == "ComboBoxEx32")
+                    {
+                        RECT r;
+                        if (GetWindowRect(hwnd, out r) && r.Top < bestTop)
+                        {
+                            bestTop = r.Top;
+                            best = hwnd;
+                        }
+                    }
+                    return true; // 继续枚举所有后代
+                }, IntPtr.Zero);
+            }
+            catch { }
+            return best;
+        }
+
+        /// <summary>
+        /// 判断 Edit 内容是否像"文件名输入框"，而非地址栏。
+        /// 返回 true 表示应跳过此 Edit（文件名框特征）。
+        /// </summary>
+        private static bool IsFilenameEditContent(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return false;
+            // 含通配符 → 文件过滤模式 (如 "*.txt", "*.docx")
+            if (text.Contains("*") || text.Contains("?")) return true;
+            // 末段含 "." → 文件名带扩展名 (如 "document.docx", "工作表.xlsx")
+            string normalized = text.TrimEnd('\\');
+            int lastSlash = normalized.LastIndexOf('\\');
+            string lastName = lastSlash >= 0 ? normalized.Substring(lastSlash + 1) : normalized;
+            return !string.IsNullOrEmpty(lastName) && lastName.Contains(".");
         }
 
         private static IntPtr FindFirstChildByClass(IntPtr parent, string className)
