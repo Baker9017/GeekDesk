@@ -169,10 +169,13 @@ namespace GeekDesk.Util
                     return false;
                 }
 
-                // 发送消息让树形对话框跳转
+                // 发送消息让树形对话框跳转（SendMessage 是同步的，返回时树已选中目标节点）
                 SendMessage(dialogHwnd, BFFM_SETSELECTION, (IntPtr)1, remoteBuffer);
                 LogUtil.WriteQuickSwitchLog("TryInjectViaSetSelection: BFFM_SETSELECTION sent OK → remotePtr=0x"
                     + remoteBuffer.ToString("X") + " path=" + path);
+
+                // BFFM_SETSELECTION 选中节点但不一定滚动到可视区，需手动 EnsureVisible
+                EnsureTreeSelectionVisible(dialogHwnd);
                 return true;
             }
             finally
@@ -180,6 +183,51 @@ namespace GeekDesk.Util
                 if (remoteBuffer != IntPtr.Zero)
                     VirtualFreeEx(hProcess, remoteBuffer, 0, MEM_RELEASE);
                 CloseHandle(hProcess);
+            }
+        }
+
+        /// <summary>
+        /// 让 SHBrowseForFolder 树形对话框把当前选中节点滚动到可视区，
+        /// 使垂直滚动条的滑块位置与选中项对应。
+        /// <para>
+        /// BFFM_SETSELECTION 只负责选中，不保证滚动。
+        /// TVM_GETNEXTITEM(TVGN_CARET) 取得选中项 HTREEITEM，
+        /// TVM_ENSUREVISIBLE 触发滚动并刷新滚动条。
+        /// HTREEITEM 是不透明句柄值，可直接跨进程通过 SendMessage 传递，
+        /// 无需 VirtualAllocEx。
+        /// </para>
+        /// </summary>
+        private static void EnsureTreeSelectionVisible(IntPtr dialogHwnd)
+        {
+            try
+            {
+                IntPtr treeHwnd = FindFirstChildByClass(dialogHwnd, "SysTreeView32");
+                if (treeHwnd == IntPtr.Zero)
+                {
+                    LogUtil.WriteQuickSwitchLog("EnsureTreeSelectionVisible: no SysTreeView32 found");
+                    return;
+                }
+
+                // commctrl.h: TVM_FIRST = 0x1100
+                const int TVM_GETNEXTITEM   = 0x1100 + 10; // 0x110A
+                const int TVM_ENSUREVISIBLE = 0x1100 + 20; // 0x1114
+                const int TVGN_CARET        = 0x0009;      // 当前光标（选中）节点
+
+                IntPtr hSelected = SendMessage(treeHwnd, TVM_GETNEXTITEM, (IntPtr)TVGN_CARET, IntPtr.Zero);
+                if (hSelected == IntPtr.Zero)
+                {
+                    LogUtil.WriteQuickSwitchLog("EnsureTreeSelectionVisible: TVGN_CARET returned null");
+                    return;
+                }
+
+                // TVM_ENSUREVISIBLE: 滚动树视图使节点进入可视区，同时刷新滚动条位置
+                IntPtr scrolled = SendMessage(treeHwnd, TVM_ENSUREVISIBLE, IntPtr.Zero, hSelected);
+                LogUtil.WriteQuickSwitchLog("EnsureTreeSelectionVisible: TVM_ENSUREVISIBLE hItem=0x"
+                    + hSelected.ToString("X") + " scrolled=" + scrolled);
+            }
+            catch (Exception ex)
+            {
+                LogUtil.WriteQuickSwitchLog("EnsureTreeSelectionVisible EX: " + ex.Message);
             }
         }
 
