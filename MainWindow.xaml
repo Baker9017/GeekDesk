@@ -40,6 +40,17 @@
         <cvt:IntToCornerRadius x:Key="IntToCornerRadius"/>
         <cvt:DoubleToGridLength x:Key="DoubleToGridLength"/>
         <cvt:ReverseBoolConvert x:Key="ReverseBoolConvert"/>
+        <ContextMenu x:Key="TaskbarContextMenu" Width="130">
+            <MenuItem Header="打开面板" Click="ShowApp"/>
+            <MenuItem Header="拾色器" Click="ColorPicker"/>
+            <MenuItem Header="备份" Click="BakDataFile"/>
+            <MenuItem Header="隐藏图标" Click="CloseBarIcon"/>
+            <MenuItem Header="待办"  Click="BacklogMenuClick"/>
+            <MenuItem Header="程序目录"  Click="OpenThisDir"/>
+            <MenuItem Header="设置"  Click="ConfigApp"/>
+            <MenuItem Header="重启"  Click="ReStartApp"/>
+            <MenuItem Header="退出" Click="ExitApp"/>
+        </ContextMenu>
     </Window.Resources>
 
     <WindowChrome.WindowChrome>
@@ -177,11 +188,11 @@
                     <StackPanel HorizontalAlignment="Right" Panel.ZIndex="99" hc:Growl.GrowlParent="False" hc:Growl.Token="MainWindowGrowl" Grid.Column="1" Grid.Row="1"/>
                     <StackPanel HorizontalAlignment="Center" Panel.ZIndex="99" hc:Growl.GrowlParent="False" hc:Growl.Token="MainWindowAskGrowl" Grid.Column="1" Grid.Row="1"/>
 
-                    <DockPanel Grid.Row="0" Grid.Column="0" MouseDown="DragMove">
+                    <DockPanel Grid.Row="0" Grid.Column="0" MouseDown="DragMove" ContextMenu="{StaticResource TaskbarContextMenu}">
                         <DockPanel.Background>
                             <SolidColorBrush Opacity="0.01"/>
                         </DockPanel.Background>
-                        <Image Visibility="{Binding AppConfig.TitleLogoVisible}" 
+                        <Image Visibility="{Binding AppConfig.TitleLogoVisible}"
                                Source="/Resource/Image/TitleLogo.png" 
                                RenderOptions.BitmapScalingMode="HighQuality" 
                                Margin="10,0,0,0" 
@@ -284,17 +295,7 @@
                     <hc:NotifyIcon Icon="/Logo.ico" Click="NotifyIcon_Click" x:Name="BarIcon"
                             Visibility="{Binding AppConfig.ShowBarIcon, Mode=TwoWay, Converter={StaticResource Boolean2VisibilityConverter}}">
                         <hc:NotifyIcon.ContextMenu>
-                            <ContextMenu Width="130" x:Name="TaskbarContextMenu">
-                                <MenuItem Header="打开面板" Click="ShowApp"/>
-                                <MenuItem Header="拾色器" Click="ColorPicker"/>
-                                <MenuItem Header="备份" Click="BakDataFile"/>
-                                <MenuItem Header="隐藏图标" Click="CloseBarIcon"/>
-                                <MenuItem Header="待办"  Click="BacklogMenuClick"/>
-                                <MenuItem Header="程序目录"  Click="OpenThisDir"/>
-                                <MenuItem Header="设置"  Click="ConfigApp"/>
-                                <MenuItem Header="重启"  Click="ReStartApp"/>
-                                <MenuItem Header="退出" Click="ExitApp"/>
-                            </ContextMenu>
+                            <StaticResource ResourceKey="TaskbarContextMenu"/>
                         </hc:NotifyIcon.ContextMenu>
                     </hc:NotifyIcon>
 

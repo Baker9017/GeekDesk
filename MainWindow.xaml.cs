@@ -1059,7 +1059,10 @@ namespace GeekDesk
         /// <param name="e"></param>
         private void ColorPicker(object sender, RoutedEventArgs e)
         {
-            TaskbarContextMenu.IsOpen = false;
+            if (sender is MenuItem menuItem && menuItem.Parent is ContextMenu contextMenu)
+            {
+                contextMenu.IsOpen = false;
+            }
             GlobalColorPickerWindow.CreateNoShow();
         }
 
