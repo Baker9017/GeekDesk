@@ -941,9 +941,6 @@ namespace GeekDesk.Util
                 p = Uri.UnescapeDataString(p);
                 p = p.Replace('/', '\\');
 
-                // 去掉 leading "\\" (UNC 不需要多一个反斜杠)
-                if (p.StartsWith("\\\\")) p = p.Substring(1);
-
                 return p;
             }
             catch
